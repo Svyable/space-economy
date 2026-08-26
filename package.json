@@ -1,0 +1,21 @@
+{
+  "name": "space-economy-clearinghouse",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Open coordination and settlement primitives for the space economy.",
+  "exports": {
+    ".": "./src/clearinghouse.js",
+    "./canonical-json": "./src/canonical-json.js",
+    "./store": "./src/store.js"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node --test",
+    "demo": "node examples/demo.js"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "license": "MIT"
+}

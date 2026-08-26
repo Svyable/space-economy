@@ -1,0 +1,378 @@
+openapi: 3.2.0
+info:
+  title: Space Economy Clearinghouse API
+  version: 0.1.0
+  description: Reference HTTP adapter for capacity-backed space-economy transactions.
+servers:
+  - url: http://localhost:8787
+paths:
+  /health:
+    get:
+      operationId: health
+      responses:
+        '200':
+          description: Health and ledger integrity status.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [ok, ledgerValid, revision]
+                properties:
+                  ok: { type: boolean }
+                  ledgerValid: { type: boolean }
+                  revision: { type: integer, minimum: 0 }
+  /v1/assets:
+    get:
+      operationId: listAssets
+      responses:
+        '200': { $ref: '#/components/responses/ListAssets' }
+    post:
+      operationId: registerAsset
+      parameters:
+        - $ref: '#/components/parameters/Actor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/RegisterAsset' }
+      responses:
+        '201': { $ref: '#/components/responses/AssetResponse' }
+        default: { $ref: '#/components/responses/Problem' }
+  /v1/offers:
+    get:
+      operationId: listOffers
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string }
+        - name: status
+          in: query
+          schema: { type: string, default: open }
+      responses:
+        '200':
+          description: Offer collection.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/Offer' }
+    post:
+      operationId: createOffer
+      parameters:
+        - $ref: '#/components/parameters/Actor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CreateOffer' }
+      responses:
+        '201': { $ref: '#/components/responses/OfferResponse' }
+        default: { $ref: '#/components/responses/Problem' }
+  /v1/orders:
+    post:
+      operationId: createOrder
+      parameters:
+        - $ref: '#/components/parameters/Actor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [offerId, quantity]
+              properties:
+                offerId: { type: string }
+                quantity: { type: integer, minimum: 1 }
+      responses:
+        '201': { $ref: '#/components/responses/OrderResponse' }
+        default: { $ref: '#/components/responses/Problem' }
+  /v1/orders/{orderId}:
+    parameters:
+      - $ref: '#/components/parameters/OrderId'
+    get:
+      operationId: getOrder
+      responses:
+        '200':
+          description: Order. The ETag value is the order version.
+          headers:
+            ETag:
+              schema: { type: string }
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: '#/components/schemas/Order' }
+        default: { $ref: '#/components/responses/Problem' }
+  /v1/orders/{orderId}/fund:
+    post:
+      operationId: fundOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Actor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [amount, reference]
+              properties:
+                amount: { type: string, pattern: '^[0-9]+$' }
+                reference: { type: string, minLength: 1 }
+      responses:
+        '200': { $ref: '#/components/responses/OrderResponse' }
+        default: { $ref: '#/components/responses/Problem' }
+  /v1/orders/{orderId}/deliver:
+    post:
+      operationId: recordDelivery
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Actor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [proof]
+              properties:
+                proof:
+                  type: object
+                  required: [type]
+                  properties:
+                    type: { type: string, minLength: 1 }
+                    data: { type: object, additionalProperties: true }
+      responses:
+        '200': { $ref: '#/components/responses/OrderResponse' }
+        default: { $ref: '#/components/responses/Problem' }
+  /v1/orders/{orderId}/settle:
+    post:
+      operationId: settleOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Actor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reference]
+              properties:
+                reference: { type: string, minLength: 1 }
+      responses:
+        '200': { $ref: '#/components/responses/OrderResponse' }
+        default: { $ref: '#/components/responses/Problem' }
+  /v1/orders/{orderId}/cancel:
+    post:
+      operationId: cancelOrder
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Actor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/OrderResponse' }
+        default: { $ref: '#/components/responses/Problem' }
+  /v1/ledger:
+    get:
+      operationId: getLedger
+      responses:
+        '200':
+          description: Hash-chained event ledger.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [valid, data]
+                properties:
+                  valid: { type: boolean }
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/LedgerEvent' }
+components:
+  parameters:
+    Actor:
+      name: x-participant-id
+      in: header
+      required: true
+      description: Development-only actor shim; production deployments must replace this with authenticated actor derivation.
+      schema: { type: string, minLength: 1 }
+    IdempotencyKey:
+      name: Idempotency-Key
+      in: header
+      required: false
+      schema: { type: string, minLength: 1, maxLength: 255 }
+    IfMatch:
+      name: If-Match
+      in: header
+      required: false
+      description: Numeric resource version for optimistic concurrency.
+      schema: { type: string }
+    OrderId:
+      name: orderId
+      in: path
+      required: true
+      schema: { type: string }
+  schemas:
+    UnitPrice:
+      type: object
+      required: [settlementAsset, amount, scale]
+      properties:
+        settlementAsset: { type: string, example: 'iso4217:USD' }
+        amount: { type: string, pattern: '^[0-9]+$', example: '1250' }
+        scale: { type: integer, minimum: 0, maximum: 18, example: 2 }
+    Identifier:
+      type: object
+      required: [scheme, value]
+      properties:
+        scheme: { type: string }
+        value: { type: string }
+    RegisterAsset:
+      type: object
+      required: [name, type]
+      properties:
+        name: { type: string }
+        type: { type: string }
+        capabilities: { type: array, items: { type: string } }
+        identifiers: { type: array, items: { $ref: '#/components/schemas/Identifier' } }
+        location: { type: [object, 'null'], additionalProperties: true }
+        metadata: { type: object, additionalProperties: true }
+    Asset:
+      allOf:
+        - $ref: '#/components/schemas/RegisterAsset'
+        - type: object
+          required: [id, ownerId, status, version, createdAt, updatedAt]
+          properties:
+            id: { type: string }
+            ownerId: { type: string }
+            status: { type: string }
+            version: { type: integer, minimum: 1 }
+            createdAt: { type: string, format: date-time }
+            updatedAt: { type: string, format: date-time }
+    CreateOffer:
+      type: object
+      required: [assetId, service, unit, unitPrice, capacity]
+      properties:
+        assetId: { type: string }
+        service: { type: string }
+        unit: { type: string }
+        unitPrice: { $ref: '#/components/schemas/UnitPrice' }
+        capacity: { type: integer, minimum: 1 }
+        windowStart: { type: [string, 'null'], format: date-time }
+        windowEnd: { type: [string, 'null'], format: date-time }
+        metadata: { type: object, additionalProperties: true }
+    Offer:
+      allOf:
+        - $ref: '#/components/schemas/CreateOffer'
+        - type: object
+          required: [id, sellerId, remaining, status, version, createdAt, updatedAt]
+          properties:
+            id: { type: string }
+            sellerId: { type: string }
+            remaining: { type: integer, minimum: 0 }
+            status: { type: string }
+            version: { type: integer, minimum: 1 }
+            createdAt: { type: string, format: date-time }
+            updatedAt: { type: string, format: date-time }
+    Order:
+      type: object
+      additionalProperties: true
+      required: [id, offerId, assetId, sellerId, buyerId, quantity, total, status, version]
+      properties:
+        id: { type: string }
+        offerId: { type: string }
+        assetId: { type: string }
+        sellerId: { type: string }
+        buyerId: { type: string }
+        quantity: { type: integer, minimum: 1 }
+        total: { $ref: '#/components/schemas/UnitPrice' }
+        status: { type: string, enum: [reserved, funded, delivered, settled, cancelled] }
+        version: { type: integer, minimum: 1 }
+    LedgerEvent:
+      type: object
+      additionalProperties: true
+      required: [specversion, id, source, type, subject, time, sequence, previoushash, data, hash]
+      properties:
+        specversion: { type: string, const: '1.0' }
+        id: { type: string }
+        source: { type: string }
+        type: { type: string }
+        subject: { type: string }
+        time: { type: string, format: date-time }
+        sequence: { type: integer, minimum: 1 }
+        previoushash: { type: string }
+        data: { type: object, additionalProperties: true }
+        hash: { type: string, pattern: '^sha256:' }
+    Problem:
+      type: object
+      required: [type, title, status, detail, code, requestId]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        detail: { type: string }
+        instance: { type: string }
+        code: { type: string }
+        requestId: { type: string }
+        details: { type: object, additionalProperties: true }
+  responses:
+    Problem:
+      description: RFC 9457 problem detail.
+      content:
+        application/problem+json:
+          schema: { $ref: '#/components/schemas/Problem' }
+    AssetResponse:
+      description: Asset.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data: { $ref: '#/components/schemas/Asset' }
+    OfferResponse:
+      description: Offer.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data: { $ref: '#/components/schemas/Offer' }
+    OrderResponse:
+      description: Order.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data: { $ref: '#/components/schemas/Order' }
+    ListAssets:
+      description: Asset collection.
+      content:
+        application/json:
+          schema:
+            type: object
+            required: [data]
+            properties:
+              data:
+                type: array
+                items: { $ref: '#/components/schemas/Asset' }
