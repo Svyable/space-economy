@@ -1,72 +1,130 @@
 # Clearinghouse Protocol v0.1
 
-The clearinghouse is intentionally small. It defines primitives that can sit underneath launch, communications, sensing, compute, docking, power, logistics, and eventually in-situ resource markets.
+The clearinghouse defines a narrow transaction kernel for markets in scarce physical capability: launch mass, relay bandwidth, observation time, power, docking windows, logistics, compute, storage, manufacturing, and other measurable services.
 
-## Design principles
+The protocol is intentionally smaller than a marketplace. Discovery, auctions, compliance, custody, telemetry interpretation, insurance, disputes, and mission-safety policy belong around the kernel as independently replaceable modules.
 
-1. **Physical capacity is scarce.** Offers reserve measurable capacity and cannot be oversubscribed.
-2. **Settlement follows delivery.** Funds move into escrow before service and are released after a delivery proof is accepted.
-3. **Assets are first-class.** Every offer is anchored to a registered physical or orbital asset with an accountable owner.
-4. **Proofs are protocol data.** Delivery proofs are opaque JSON at v0.1 so each market can evolve domain-specific verification independently.
-5. **Auditability is built in.** Mutations append to a SHA-256 hash chain, creating tamper-evident receipts without requiring a blockchain.
-6. **Money rails are pluggable.** `currency` is an identifier, not a payment implementation. Fiat, stablecoin, credits, or bilateral settlement can be integrated behind the escrow boundary.
+## Core invariants
+
+1. **Capacity is conserved.** An offer's `remaining` quantity is never negative or greater than its published `capacity`.
+2. **Billable quantities are integral quanta.** Sellers choose the smallest practical `unit` (for example gram, second, MB, Wh) and capacities/orders are positive safe integers. This avoids floating-point inventory drift.
+3. **Money is exact.** Prices use `{ settlementAsset, amount, scale }`, where `amount` is an unsigned integer string. `iso4217:USD` with `amount: "1250"` and `scale: 2` means USD 12.50. Totals are calculated with integer arithmetic.
+4. **Actor identity is transport context, not payload.** Buyer, seller, and owner identities are derived from the authenticated actor context supplied to the kernel. The demo HTTP adapter uses `x-participant-id` only as a local-development stand-in.
+5. **Mutations are retry-safe.** An idempotency key can be persisted with a command result. Replaying the same command returns the original result; reusing a key with different input fails.
+6. **Mutable resources are versioned.** Offers and orders carry monotonically increasing `version` values for optimistic concurrency checks.
+7. **Persistence is transactional from the kernel's point of view.** If persistence fails, in-memory mutation is rolled back. Stores receive the expected prior revision so production adapters can implement compare-and-swap semantics.
+8. **Funded reservations are not silently cancelled.** Releasing funded capacity requires a refund/dispute rail; the v0.1 kernel refuses that transition rather than creating inconsistent financial state.
+9. **Proofs are recorded, not magically trusted.** Delivery proofs are hashed and marked `unverified` until a future service-specific verifier attests them.
+10. **Every successful mutation emits a tamper-evident event.** Events use a CloudEvents-compatible envelope and an RFC 8785-canonicalized SHA-256 hash chain.
 
 ## Core objects
 
 ### Asset
 
-Represents an economically useful physical system: launch vehicle, satellite, ground station, tug, habitat, power plant, telescope, depot, rover, or manufacturing node.
+Represents an economically useful physical system: launch vehicle, satellite, ground station, tug, habitat, power system, telescope, depot, rover, manufacturing node, or other service-producing infrastructure.
 
-Required fields: `owner`, `name`, `type`.
+Asset identifiers are namespaced rather than hard-coded. Examples:
+
+```json
+[
+  { "scheme": "cospar", "value": "2026-001A" },
+  { "scheme": "norad-cat-id", "value": "99999" },
+  { "scheme": "operator", "value": "relay-one:a" }
+]
+```
+
+The protocol does not treat a catalog identifier as proof of ownership or control.
 
 ### Offer
 
-Publishes sellable capacity from an asset. Examples include kilograms to orbit, GB relayed, kWh delivered, minutes of observation time, cubic meters of pressurized volume, or docking slots.
+Publishes measurable capacity from one asset.
 
-Required fields: `assetId`, `seller`, `service`, `unit`, `pricePerUnit`, `currency`, `capacity`.
+```json
+{
+  "assetId": "<asset-id>",
+  "service": "data-relay",
+  "unit": "MB",
+  "unitPrice": {
+    "settlementAsset": "iso4217:USD",
+    "amount": "15",
+    "scale": 2
+  },
+  "capacity": 500000
+}
+```
+
+`service` and `unit` are extensible identifiers. Domain profiles may later define controlled vocabularies without changing the clearinghouse kernel.
 
 ### Order
 
-Reserves a quantity from an offer. State progression:
+Reserves quantity against exactly one offer.
+
+Lifecycle:
 
 `reserved -> funded -> delivered -> settled`
 
-Orders may be cancelled while `reserved` or `funded`, returning capacity to the offer.
+`settled` in v0.1 means the clearinghouse has recorded a settlement reference approved by the buyer. It does **not** prove that this reference moved real funds unless the deployment's settlement adapter provides that guarantee.
 
 ### Delivery proof
 
-A domain-specific JSON object recorded by the seller. In production, proof verification should be delegated to service-specific verifiers (signed telemetry receipts, custody-transfer records, ranging data, ground-station logs, trusted oracles, etc.).
+A proof has a `type` plus arbitrary JSON `data`. The kernel stores a canonical SHA-256 digest and verification state.
 
-### Ledger entry
+```json
+{
+  "type": "telemetry-receipt",
+  "data": {
+    "receipt": "telemetry-receipt-001",
+    "deliveredQuantity": 20000
+  }
+}
+```
 
-Each mutation emits an event with `sequence`, `timestamp`, `previousHash`, and `hash`. This provides local tamper evidence and a clean bridge to external transparency logs or distributed ledgers if required later.
+Future verifier adapters should transform `verification.status` from `unverified` to a domain-specific attestation before automated settlement policies rely on it.
 
-## API surface
+### Ledger event
 
-- `GET /health`
-- `GET|POST /assets`
-- `GET|POST /offers`
-- `POST /orders`
-- `GET /orders/:id`
-- `POST /orders/:id/fund`
-- `POST /orders/:id/deliver`
-- `POST /orders/:id/settle`
-- `POST /orders/:id/cancel`
-- `GET /ledger`
+Each successful mutation emits a CloudEvents-compatible structured event with:
 
-## What v0.1 deliberately does not do
+- `specversion`, `id`, `source`, `type`, `subject`, `time`, `datacontenttype`, and `data`;
+- `sequence` and `previoushash` extension attributes;
+- `hash`, computed over the event without the `hash` field using RFC 8785-compatible canonical JSON and SHA-256.
 
-Authentication, KYC/KYB, sanctions screening, legal contract generation, custody of real funds, cryptographic asset identity, telemetry verification, dispute resolution, multi-currency conversion, auctions, derivatives, and orbital-safety rules are intentionally outside this first slice.
+The chain is tamper-evident, not a decentralized consensus mechanism.
 
-Those belong in separate modules around the narrow coordination kernel rather than being hard-coded into it.
+## API behavior
 
-## Suggested next protocol modules
+The HTTP reference adapter uses `/v1` paths and RFC 9457 problem details.
 
-1. DID/public-key based participant and asset identity.
-2. Signed offer/order envelopes for offline and cross-network operation.
-3. Verifier interface for telemetry-backed delivery proofs.
-4. Payment adapter interface for ACH/wire/stablecoin/internal credits.
-5. Time-bounded reservations and automatic expiry.
-6. Auction and RFQ market mechanisms.
-7. Insurance hooks and dispute windows.
-8. Orbital conjunction / regulatory policy gates before reservation.
+Mutating requests should send:
+
+- `x-participant-id`: development-only actor adapter;
+- `Idempotency-Key`: stable retry key for a logical command;
+- `If-Match`: optional numeric resource version for optimistic concurrency on existing resources.
+
+The contract is defined in [`openapi.yaml`](../openapi.yaml).
+
+## Storage port
+
+The kernel accepts a snapshot store with two operations:
+
+```text
+load() -> snapshot | null
+save(snapshot, { expectedRevision })
+```
+
+`MemorySnapshotStore` and `JsonFileSnapshotStore` are reference adapters. The JSON adapter is single-writer local infrastructure; production deployments should use a transactional database adapter that enforces the expected revision atomically.
+
+Persisted state includes a `schemaVersion` and refuses unknown versions instead of guessing how to interpret future data.
+
+## Trust boundaries deliberately outside v0.1
+
+- authentication and key custody;
+- KYB/KYC, sanctions, export controls, licensing, and jurisdiction policy;
+- cryptographic participant/asset credentials;
+- proof verification and telemetry trust;
+- actual escrow/custody/payment execution;
+- refunds, chargebacks, disputes, and insurance;
+- conjunction assessment and mission-safety policy;
+- auctions, RFQs, derivatives, and multi-leg contracts.
+
+These should be adapters or higher-level protocols, not hidden assumptions inside capacity accounting.

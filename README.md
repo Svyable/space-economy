@@ -1,41 +1,61 @@
 # Space Economy
 
-A small, open **orbital clearinghouse** for coordinating economically useful space assets, scarce service capacity, delivery proofs, and settlement.
+Open infrastructure for coordinating **assets, scarce physical capacity, delivery evidence, and settlement records** across the space economy.
 
-The thesis is simple: the space economy will need shared transaction infrastructure before it needs another vertically integrated marketplace. Launch providers, satellite operators, ground networks, tugs, depots, power systems, habitats, observatories, manufacturers, and lunar operators all need a common way to describe assets, sell measurable capacity, reserve it without oversubscription, prove delivery, and settle.
+The thesis: launch, communications, sensing, power, docking, logistics, compute, manufacturing, and surface operations should not each reinvent bilateral booking and settlement. They need a small common transaction kernel that can sit underneath many market designs.
 
-This repository is a zero-dependency Node.js reference implementation of those primitives.
+This repository is a zero-runtime-dependency Node.js reference implementation of that kernel.
 
-## What exists today
+## What the kernel does
 
-- Asset registry for economically useful physical systems.
-- Capacity offers with units, price, currency, availability windows, and remaining inventory.
-- Capacity-backed orders that cannot oversubscribe an offer.
-- Escrow lifecycle: `reserved -> funded -> delivered -> settled`.
-- Domain-agnostic delivery proofs.
-- Cancellation before delivery with capacity restoration.
-- Append-only SHA-256 hash-chained audit ledger.
-- JSON persistence for local development.
-- REST API, executable demo, tests, and GitHub Actions CI.
+- Registers economically useful physical assets with extensible external identifiers.
+- Publishes measurable service capacity without oversubscription.
+- Uses exact integer monetary arithmetic instead of floating-point prices.
+- Reserves orders with persisted idempotency for safe retries.
+- Tracks resource versions for optimistic concurrency.
+- Separates actor identity from request payloads.
+- Records funding references, delivery proofs, and settlement references.
+- Refuses financially unsafe transitions such as silently cancelling funded capacity.
+- Emits CloudEvents-compatible, RFC 8785-canonicalized SHA-256 ledger events.
+- Persists schema-versioned snapshots behind a replaceable storage port.
+- Exposes a versioned HTTP API with RFC 9457 errors and an OpenAPI 3.2 contract.
 
-## Why this layer
+## What it deliberately does not pretend to do
 
-Most space markets are really markets for scarce physical capability:
+The reference server does **not** authenticate participants, custody funds, verify telemetry, prove spacecraft ownership, run conjunction assessment, perform KYC/KYB, or satisfy export-control/licensing requirements. Those are explicit adapter and policy boundaries, not hidden TODOs.
 
-- kilograms to a destination orbit;
-- minutes of observation time;
-- gigabytes relayed;
-- kilowatt-hours delivered;
-- docking windows;
-- maneuver delta-v;
+Read [`SECURITY.md`](SECURITY.md) before deploying anything beyond local development.
+
+## Why capacity is modeled this way
+
+Most space markets reduce to a scarce measurable quantum:
+
+- grams or kilograms to a destination;
+- seconds of observation or antenna time;
+- MB/GB relayed;
+- Wh/kWh delivered;
+- docking slots;
+- maneuver quanta;
 - pressurized volume;
 - storage, compute, manufacturing, or surface logistics.
 
-If those capabilities can share a minimal contract and settlement model, higher-level products can interoperate instead of rebuilding bilateral coordination from scratch.
+The seller chooses the smallest practical billable `unit`, and quantity is integral. This keeps inventory accounting exact.
+
+Money is also exact:
+
+```json
+{
+  "settlementAsset": "iso4217:USD",
+  "amount": "1250",
+  "scale": 2
+}
+```
+
+That means USD 12.50. The integer is encoded as a string so arithmetic never depends on IEEE-754 monetary rounding and the model can extend to non-fiat settlement assets.
 
 ## Run it
 
-Requires Node.js 20+.
+Requires Node.js 22 or 24 LTS. Node 20 is intentionally not supported because it reached end-of-life in 2026.
 
 ```bash
 npm test
@@ -43,107 +63,117 @@ npm run demo
 npm start
 ```
 
-The API listens on `http://localhost:8787` by default and persists state to `./data/state.json`.
+Defaults:
 
-Environment variables:
-
-```bash
+```text
 PORT=8787
 STATE_PATH=./data/state.json
+MAX_BODY_BYTES=1048576
 ```
 
 ## API
 
 ```text
 GET  /health
-GET  /assets
-POST /assets
-GET  /offers?service=data-relay
-POST /offers
-POST /orders
-GET  /orders/:id
-POST /orders/:id/fund
-POST /orders/:id/deliver
-POST /orders/:id/settle
-POST /orders/:id/cancel
-GET  /ledger
+GET  /v1/assets
+POST /v1/assets
+GET  /v1/offers
+POST /v1/offers
+POST /v1/orders
+GET  /v1/orders/:id
+POST /v1/orders/:id/fund
+POST /v1/orders/:id/deliver
+POST /v1/orders/:id/settle
+POST /v1/orders/:id/cancel
+GET  /v1/ledger
 ```
 
-### Example asset
+Mutating calls use a development-only `x-participant-id` actor header. Add an `Idempotency-Key` for retry safety. Existing resources may also use `If-Match: "<version>"`.
 
-```json
-{
-  "owner": "relay-one",
-  "name": "Relay One A",
-  "type": "communications-satellite",
-  "capabilities": ["data-relay"],
-  "location": { "orbit": "LEO" }
-}
+### Register an asset
+
+```bash
+curl -X POST http://localhost:8787/v1/assets \
+  -H 'content-type: application/json' \
+  -H 'x-participant-id: relay-one' \
+  -H 'Idempotency-Key: asset-1' \
+  -d '{
+    "name":"Relay One A",
+    "type":"communications-satellite",
+    "capabilities":["data-relay"],
+    "identifiers":[{"scheme":"cospar","value":"2026-001A"}],
+    "location":{"orbit":"LEO"}
+  }'
 ```
 
-### Example offer
+### Publish capacity
 
 ```json
 {
   "assetId": "<asset-id>",
-  "seller": "relay-one",
   "service": "data-relay",
-  "unit": "GB",
-  "pricePerUnit": 15,
-  "currency": "USD",
-  "capacity": 500
+  "unit": "MB",
+  "unitPrice": {
+    "settlementAsset": "iso4217:USD",
+    "amount": "15",
+    "scale": 2
+  },
+  "capacity": 500000
 }
 ```
 
-### Example order lifecycle
-
-```bash
-# reserve capacity
-curl -X POST http://localhost:8787/orders \
-  -H 'content-type: application/json' \
-  -d '{"offerId":"<offer-id>","buyer":"lunar-mapper","quantity":20}'
-
-# fund the exact contract value
-curl -X POST http://localhost:8787/orders/<order-id>/fund \
-  -H 'content-type: application/json' \
-  -d '{"buyer":"lunar-mapper","amount":300}'
-
-# seller records a service-specific proof
-curl -X POST http://localhost:8787/orders/<order-id>/deliver \
-  -H 'content-type: application/json' \
-  -d '{"seller":"relay-one","proof":{"receipt":"telemetry-receipt-001","deliveredQuantity":20}}'
-
-# buyer approves settlement
-curl -X POST http://localhost:8787/orders/<order-id>/settle \
-  -H 'content-type: application/json' \
-  -d '{"buyer":"lunar-mapper"}'
-```
+A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,000.00, with no floating-point multiplication.
 
 ## Architecture
 
 ```text
-participants / applications
-          |
-          v
-      REST API
-          |
-          v
-  Clearinghouse kernel
-   /      |       \
-registry market  settlement
-   \      |       /
-    hash-chained ledger
-          |
-          v
-   JSON state adapter
+ authenticated transports / market applications
+                    |
+                    v
+              versioned API
+                    |
+                    v
+          clearinghouse domain kernel
+          /          |           \
+   asset registry  capacity      orders
+          \          |           /
+        CloudEvents-compatible event ledger
+                    |
+             snapshot store port
+              /             \
+       memory/dev JSON    production DB
+
+External policy/adapters:
+identity • credentials • payments • proof verification • compliance
+conjunction safety • disputes • insurance • auctions/RFQs
 ```
 
-The kernel deliberately does **not** custody real funds or decide what constitutes a valid telemetry proof. Those should be adapters with explicit trust, regulatory, and domain boundaries.
+The core storage contract is deliberately tiny: `load()` and `save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer; a production database adapter should enforce compare-and-swap transactionally.
 
-See [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for the protocol model and extension path.
+## Standards strategy
 
-## Roadmap
+The project uses or targets existing interoperability standards rather than replacing them:
 
-The next useful layers are participant/asset cryptographic identity, signed orders, telemetry proof verifiers, real payment adapters, reservation expiry, auctions/RFQs, dispute windows, insurance hooks, and orbital-safety/regulatory policy gates.
+- RFC 8785 canonical JSON for hashing;
+- RFC 9457 problem details for API errors;
+- CloudEvents 1.0.2 for portable event envelopes;
+- OpenAPI 3.2.0 for the HTTP contract;
+- ISO 4217 namespacing for fiat settlement assets;
+- CCSDS Orbit Data Messages and Conjunction Data Messages at space-data boundaries;
+- W3C DID / Verifiable Credentials as optional identity and credential adapters.
 
-The goal is not to predict every future space business. It is to make their transactions composable.
+See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale and [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for invariants and trust boundaries.
+
+## Near-term roadmap
+
+1. Production database adapter with atomic revision compare-and-swap.
+2. Authentication/authorization port and signed command envelopes.
+3. Verifiable participant and asset-control credentials.
+4. Service-specific delivery-proof verifier interface.
+5. Settlement/custody adapters with refunds and disputes.
+6. Reservation expiry and time-window policy.
+7. RFQ/auction matching above the clearing kernel.
+8. CCSDS-backed orbit/conjunction policy gates.
+9. External ledger anchoring and receipt export.
+
+The long-term goal is not one marketplace. It is a transaction substrate that many independent space businesses can compose around.
