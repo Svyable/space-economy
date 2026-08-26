@@ -7,6 +7,7 @@ function serialize(value, seen) {
     case 'boolean':
       return value ? 'true' : 'false';
     case 'string':
+      if (!value.isWellFormed()) throw new TypeError('canonical JSON requires well-formed Unicode strings');
       return JSON.stringify(value);
     case 'number':
       if (!Number.isFinite(value)) throw new TypeError('canonical JSON requires finite numbers');
@@ -23,6 +24,7 @@ function serialize(value, seen) {
         const fields = Object.keys(value)
           .sort()
           .map((key) => {
+            if (!key.isWellFormed()) throw new TypeError('canonical JSON requires well-formed Unicode property names');
             if (value[key] === undefined) throw new TypeError('canonical JSON does not support undefined');
             return `${JSON.stringify(key)}:${serialize(value[key], seen)}`;
           });
