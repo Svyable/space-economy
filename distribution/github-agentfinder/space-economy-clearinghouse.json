@@ -1,0 +1,21 @@
+{
+  "identifier": "urn:ai:github.com:Svyable:space-economy:space-economy-clearinghouse",
+  "displayName": "Space Economy Clearinghouse",
+  "mediaType": "application/ai-skill",
+  "url": "https://github.com/Svyable/space-economy/blob/main/.agents/skills/space-economy-clearinghouse/SKILL.md",
+  "description": "Design and integrate interoperable transaction infrastructure for orbital capacity, space logistics, asset registries, booking, delivery proofs, settlement coordination, and other scarce physical capabilities in the space economy.",
+  "tags": [
+    "space-economy",
+    "orbital-economy",
+    "space-logistics",
+    "capacity-market",
+    "clearinghouse",
+    "asset-registry",
+    "settlement",
+    "agent-skill"
+  ],
+  "metadata": {
+    "sourceSet": "space-economy",
+    "repoPath": ".agents/skills/space-economy-clearinghouse/SKILL.md"
+  }
+}
