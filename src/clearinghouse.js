@@ -82,10 +82,19 @@ export class Clearinghouse {
     this.clock = clock;
     this.idGenerator = idGenerator;
     this.eventSource = eventSource;
+    this.commandQueue = Promise.resolve();
     this.#initializeEmpty();
+    this.initialization = this.#loadPersisted();
+    this.initialization.catch(() => {});
+  }
 
-    const persisted = this.store.load();
-    if (persisted) this.#restore(persisted);
+  static async open(options = {}) {
+    return new Clearinghouse(options).ready();
+  }
+
+  async ready() {
+    await this.initialization;
+    return this;
   }
 
   registerAsset(input, context) {
@@ -117,7 +126,7 @@ export class Clearinghouse {
   }
 
   listAssets() {
-    return [...this.assets.values()].map((asset) => clone(asset));
+    return this.#read(() => [...this.assets.values()].map((asset) => clone(asset)));
   }
 
   createOffer(input, context) {
@@ -162,9 +171,9 @@ export class Clearinghouse {
   }
 
   listOffers({ service, status = 'open' } = {}) {
-    return [...this.offers.values()]
+    return this.#read(() => [...this.offers.values()]
       .filter((offer) => (!service || offer.service === service) && (!status || offer.status === status))
-      .map((offer) => clone(offer));
+      .map((offer) => clone(offer)));
   }
 
   createOrder(input, context) {
@@ -323,28 +332,19 @@ export class Clearinghouse {
   }
 
   getOrder(orderId) {
-    return clone(this.#order(orderId));
+    return this.#read(() => clone(this.#order(orderId)));
   }
 
   getLedger() {
-    return clone(this.ledger);
+    return this.#read(() => clone(this.ledger));
   }
 
   getRevision() {
-    return this.revision;
+    return this.#read(() => this.revision);
   }
 
   verifyLedger() {
-    let previousHash = 'GENESIS';
-    for (let index = 0; index < this.ledger.length; index += 1) {
-      const entry = this.ledger[index];
-      const { hash, ...unsigned } = entry;
-      if (entry.sequence !== index + 1) return false;
-      if (entry.previoushash !== previousHash) return false;
-      if (`sha256:${sha256Canonical(unsigned)}` !== hash) return false;
-      previousHash = hash;
-    }
-    return true;
+    return this.#read(() => this.#verifyLedgerNow());
   }
 
   #initializeEmpty() {
@@ -356,36 +356,60 @@ export class Clearinghouse {
     this.revision = 0;
   }
 
+  async #loadPersisted() {
+    const persisted = await this.store.load();
+    if (persisted) this.#restore(persisted);
+  }
+
   #command(operation, rawContext, fingerprintData, mutator) {
-    const context = normalizeContext(rawContext);
-    const fingerprint = sha256Canonical({ operation, actorId: context.actorId, input: fingerprintData });
-    const idempotencyId = context.idempotencyKey ? `${context.actorId}\u0000${operation}\u0000${context.idempotencyKey}` : null;
+    const execute = async () => {
+      await this.initialization;
+      const context = normalizeContext(rawContext);
+      const fingerprint = sha256Canonical({ operation, actorId: context.actorId, input: fingerprintData });
+      const idempotencyId = context.idempotencyKey ? `${context.actorId}\u0000${operation}\u0000${context.idempotencyKey}` : null;
 
-    if (idempotencyId && this.idempotency.has(idempotencyId)) {
-      const prior = this.idempotency.get(idempotencyId);
-      invariant(prior.fingerprint === fingerprint, 'IDEMPOTENCY_CONFLICT', 'idempotency key was already used with a different request');
-      return clone(prior.result);
-    }
-
-    const before = this.#snapshot();
-    const expectedRevision = this.revision;
-    try {
-      const result = mutator(context);
-      this.revision += 1;
-      if (idempotencyId) {
-        this.idempotency.set(idempotencyId, {
-          fingerprint,
-          result: clone(result),
-          createdAt: this.#now(),
-        });
+      if (idempotencyId && this.idempotency.has(idempotencyId)) {
+        const prior = this.idempotency.get(idempotencyId);
+        invariant(prior.fingerprint === fingerprint, 'IDEMPOTENCY_CONFLICT', 'idempotency key was already used with a different request');
+        return clone(prior.result);
       }
-      this.store.save(this.#snapshot(), { expectedRevision });
-      return clone(result);
-    } catch (error) {
-      this.#restore(before, { verify: false });
-      if (error instanceof StoreConflictError) throw new DomainError('STORE_CONFLICT', 'state changed concurrently; retry the command');
-      throw error;
-    }
+
+      const before = this.#snapshot();
+      const expectedRevision = this.revision;
+      try {
+        const result = await mutator(context);
+        this.revision += 1;
+        if (idempotencyId) {
+          this.idempotency.set(idempotencyId, {
+            fingerprint,
+            result: clone(result),
+            createdAt: this.#now(),
+          });
+        }
+        await this.store.save(this.#snapshot(), { expectedRevision });
+        return clone(result);
+      } catch (error) {
+        this.#restore(before, { verify: false });
+        if (error instanceof StoreConflictError) {
+          const latest = await this.store.load();
+          if (latest) this.#restore(latest);
+          else this.#initializeEmpty();
+          throw new DomainError('STORE_CONFLICT', 'state changed concurrently; retry the command');
+        }
+        throw error;
+      }
+    };
+
+    const pending = this.commandQueue.then(execute);
+    this.commandQueue = pending.then(() => undefined, () => undefined);
+    return pending;
+  }
+
+  async #read(reader) {
+    await this.initialization;
+    const pendingCommands = this.commandQueue;
+    await pendingCommands;
+    return reader();
   }
 
   #expectVersion(resource, expectedVersion) {
@@ -411,6 +435,19 @@ export class Clearinghouse {
       data: clone(data),
     };
     this.ledger.push({ ...unsigned, hash: `sha256:${sha256Canonical(unsigned)}` });
+  }
+
+  #verifyLedgerNow() {
+    let previousHash = 'GENESIS';
+    for (let index = 0; index < this.ledger.length; index += 1) {
+      const entry = this.ledger[index];
+      const { hash, ...unsigned } = entry;
+      if (entry.sequence !== index + 1) return false;
+      if (entry.previoushash !== previousHash) return false;
+      if (`sha256:${sha256Canonical(unsigned)}` !== hash) return false;
+      previousHash = hash;
+    }
+    return true;
   }
 
   #order(id) {
@@ -454,6 +491,6 @@ export class Clearinghouse {
     this.ledger = state.ledger ?? [];
     this.idempotency = new Map(state.idempotency ?? []);
     this.revision = state.revision;
-    if (verify) invariant(this.verifyLedger(), 'CORRUPT_STATE', 'persisted ledger failed integrity verification');
+    if (verify) invariant(this.#verifyLedgerNow(), 'CORRUPT_STATE', 'persisted ledger failed integrity verification');
   }
 }

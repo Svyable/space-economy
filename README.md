@@ -17,7 +17,8 @@ This repository is a zero-runtime-dependency Node.js reference implementation of
 - Records funding references, delivery proofs, and settlement references.
 - Refuses financially unsafe transitions such as silently cancelling funded capacity.
 - Emits CloudEvents-compatible, RFC 8785-canonicalized SHA-256 ledger events.
-- Persists schema-versioned snapshots behind a replaceable storage port.
+- Persists schema-versioned snapshots behind an asynchronous replaceable storage port.
+- Serializes local mutations and uses revision compare-and-swap for cross-instance races.
 - Exposes a versioned HTTP API with RFC 9457 errors and an OpenAPI 3.2 contract.
 
 ## What it deliberately does not pretend to do
@@ -70,6 +71,24 @@ PORT=8787
 STATE_PATH=./data/state.json
 MAX_BODY_BYTES=1048576
 ```
+
+## Library usage
+
+The domain API is asynchronous so a networked transactional database can replace the reference stores without changing application code.
+
+```js
+import { Clearinghouse } from './src/clearinghouse.js';
+
+const market = await Clearinghouse.open();
+const asset = await market.registerAsset(
+  { name: 'Relay A', type: 'communications-satellite' },
+  { actorId: 'relay-one', idempotencyKey: 'asset-1' },
+);
+
+console.log(asset.id);
+```
+
+`Clearinghouse.open(options)` is the preferred construction path because it loads and validates persisted state before returning. Mutations are serialized within one instance; reads wait for mutations that were already enqueued, so callers do not observe uncommitted in-memory state.
 
 ## API
 
@@ -139,7 +158,7 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
           \          |           /
         CloudEvents-compatible event ledger
                     |
-             snapshot store port
+          async snapshot store port
               /             \
        memory/dev JSON    production DB
 
@@ -148,7 +167,7 @@ identity • credentials • payments • proof verification • compliance
 conjunction safety • disputes • insurance • auctions/RFQs
 ```
 
-The core storage contract is deliberately tiny: `load()` and `save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer; a production database adapter should enforce compare-and-swap transactionally.
+The core storage contract is deliberately tiny: `await load()` and `await save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer; a production database adapter should enforce compare-and-swap transactionally. A lost cross-process race refreshes the in-memory instance from the winning snapshot before returning `STORE_CONFLICT`, so an application can retry against current state.
 
 ## Standards strategy
 
@@ -156,18 +175,19 @@ The project uses or targets existing interoperability standards rather than repl
 
 - RFC 8785 canonical JSON for hashing;
 - RFC 9457 problem details for API errors;
+- RFC 9421 HTTP Message Signatures and RFC 9530 Digest Fields at the production authentication boundary;
 - CloudEvents 1.0.2 for portable event envelopes;
 - OpenAPI 3.2.0 for the HTTP contract;
 - ISO 4217 namespacing for fiat settlement assets;
 - CCSDS Orbit Data Messages and Conjunction Data Messages at space-data boundaries;
 - W3C DID / Verifiable Credentials as optional identity and credential adapters.
 
-See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale and [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for invariants and trust boundaries.
+See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md) for the production identity boundary, and [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for invariants and trust boundaries.
 
 ## Near-term roadmap
 
-1. Production database adapter with atomic revision compare-and-swap.
-2. Authentication/authorization port and signed command envelopes.
+1. Production database adapter implementing atomic revision compare-and-swap on the async store port.
+2. Production authentication adapters and signed-request profiles.
 3. Verifiable participant and asset-control credentials.
 4. Service-specific delivery-proof verifier interface.
 5. Settlement/custody adapters with refunds and disputes.
