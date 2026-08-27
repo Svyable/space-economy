@@ -1,6 +1,7 @@
 import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, URL } from 'node:url';
+import { developmentHeaderAuthenticator } from './auth.js';
 import { Clearinghouse } from './clearinghouse.js';
 
 const json = (res, status, body, headers = {}) => {
@@ -36,7 +37,8 @@ const problem = (req, res, status, error, requestId) => {
 
 const readBody = async (req, maxBodyBytes) => {
   const contentType = req.headers['content-type'] ?? '';
-  if (!contentType.toLowerCase().startsWith('application/json')) {
+  const mediaType = String(contentType).split(';', 1)[0].trim().toLowerCase();
+  if (mediaType !== 'application/json') {
     const error = new Error('content-type must be application/json');
     error.code = 'UNSUPPORTED_MEDIA_TYPE';
     throw error;
@@ -67,11 +69,19 @@ const parseIfMatch = (req) => {
   return Number(match[1]);
 };
 
-const context = (req) => ({
-  actorId: req.headers['x-participant-id'],
-  idempotencyKey: req.headers['idempotency-key'] ?? null,
-  expectedVersion: parseIfMatch(req),
-});
+const requestContext = async (req, authenticate) => {
+  const identity = await authenticate(req);
+  if (identity !== null && identity !== undefined && (typeof identity !== 'object' || typeof identity.actorId !== 'string')) {
+    const error = new Error('authenticator must return null or an object containing actorId');
+    error.code = 'INVALID_CONFIGURATION';
+    throw error;
+  }
+  return {
+    actorId: identity?.actorId,
+    idempotencyKey: req.headers['idempotency-key'] ?? null,
+    expectedVersion: parseIfMatch(req),
+  };
+};
 
 const statusByCode = {
   NOT_FOUND: 404,
@@ -89,7 +99,7 @@ const statusByCode = {
   INVALID_CONFIGURATION: 500,
 };
 
-async function route(req, res, requestId, market, maxBodyBytes) {
+async function route(req, res, requestId, market, maxBodyBytes, authenticate) {
   const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
   const parts = url.pathname.split('/').filter(Boolean);
 
@@ -100,16 +110,16 @@ async function route(req, res, requestId, market, maxBodyBytes) {
     return json(res, 200, { data: market.listAssets() }, { 'x-request-id': requestId });
   }
   if (req.method === 'POST' && url.pathname === '/v1/assets') {
-    return json(res, 201, { data: market.registerAsset(await readBody(req, maxBodyBytes), context(req)) }, { 'x-request-id': requestId });
+    return json(res, 201, { data: market.registerAsset(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
   }
   if (req.method === 'GET' && url.pathname === '/v1/offers') {
     return json(res, 200, { data: market.listOffers({ service: url.searchParams.get('service') ?? undefined, status: url.searchParams.get('status') ?? 'open' }) }, { 'x-request-id': requestId });
   }
   if (req.method === 'POST' && url.pathname === '/v1/offers') {
-    return json(res, 201, { data: market.createOffer(await readBody(req, maxBodyBytes), context(req)) }, { 'x-request-id': requestId });
+    return json(res, 201, { data: market.createOffer(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
   }
   if (req.method === 'POST' && url.pathname === '/v1/orders') {
-    return json(res, 201, { data: market.createOrder(await readBody(req, maxBodyBytes), context(req)) }, { 'x-request-id': requestId });
+    return json(res, 201, { data: market.createOrder(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
   }
   if (req.method === 'GET' && parts[0] === 'v1' && parts[1] === 'orders' && parts.length === 3) {
     const order = market.getOrder(parts[2]);
@@ -119,10 +129,11 @@ async function route(req, res, requestId, market, maxBodyBytes) {
     const orderId = parts[2];
     const action = parts[3];
     const body = action === 'cancel' ? {} : await readBody(req, maxBodyBytes);
-    if (action === 'fund') return json(res, 200, { data: market.fundOrder(orderId, body, context(req)) }, { 'x-request-id': requestId });
-    if (action === 'deliver') return json(res, 200, { data: market.recordDelivery(orderId, body, context(req)) }, { 'x-request-id': requestId });
-    if (action === 'settle') return json(res, 200, { data: market.settleOrder(orderId, body, context(req)) }, { 'x-request-id': requestId });
-    if (action === 'cancel') return json(res, 200, { data: market.cancelOrder(orderId, context(req)) }, { 'x-request-id': requestId });
+    const commandContext = await requestContext(req, authenticate);
+    if (action === 'fund') return json(res, 200, { data: market.fundOrder(orderId, body, commandContext) }, { 'x-request-id': requestId });
+    if (action === 'deliver') return json(res, 200, { data: market.recordDelivery(orderId, body, commandContext) }, { 'x-request-id': requestId });
+    if (action === 'settle') return json(res, 200, { data: market.settleOrder(orderId, body, commandContext) }, { 'x-request-id': requestId });
+    if (action === 'cancel') return json(res, 200, { data: market.cancelOrder(orderId, commandContext) }, { 'x-request-id': requestId });
   }
   if (req.method === 'GET' && url.pathname === '/v1/ledger') {
     return json(res, 200, { valid: market.verifyLedger(), data: market.getLedger() }, { 'x-request-id': requestId });
@@ -133,12 +144,17 @@ async function route(req, res, requestId, market, maxBodyBytes) {
   throw error;
 }
 
-export function createHttpServer({ market = new Clearinghouse(), maxBodyBytes = 1_048_576 } = {}) {
+export function createHttpServer({
+  market = new Clearinghouse(),
+  maxBodyBytes = 1_048_576,
+  authenticate = developmentHeaderAuthenticator,
+} = {}) {
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) throw new TypeError('maxBodyBytes must be a positive safe integer');
+  if (typeof authenticate !== 'function') throw new TypeError('authenticate must be a function');
   return http.createServer(async (req, res) => {
     const requestId = req.headers['x-request-id'] || randomUUID();
     try {
-      await route(req, res, requestId, market, maxBodyBytes);
+      await route(req, res, requestId, market, maxBodyBytes, authenticate);
     } catch (error) {
       problem(req, res, statusByCode[error.code] ?? 400, error, requestId);
     }
