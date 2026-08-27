@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { sha256Canonical } from './canonical-json.js';
+import { MigratingSnapshotStore } from './migrations.js';
+import { CURRENT_SCHEMA_VERSION, createClearinghouseMigrationRegistry } from './schema.js';
 import { JsonFileSnapshotStore, MemorySnapshotStore, StoreConflictError } from './store.js';
 
-const SCHEMA_VERSION = 1;
 const clone = (value) => structuredClone(value);
 const EVENT_SPEC_VERSION = '1.0';
 
@@ -27,6 +28,11 @@ function nonEmptyString(value, field) {
 function positiveInteger(value, field) {
   invariant(Number.isSafeInteger(value) && value > 0, 'INVALID_REQUEST', `${field} must be a positive safe integer`);
   return value;
+}
+
+function optionalPositiveInteger(value, field) {
+  if (value === null || value === undefined) return null;
+  return positiveInteger(value, field);
 }
 
 function normalizeUnitPrice(value) {
@@ -78,7 +84,8 @@ export class Clearinghouse {
     eventSource = 'urn:space-economy:clearinghouse',
   } = {}) {
     invariant(!(statePath && store), 'INVALID_CONFIGURATION', 'provide either statePath or store, not both');
-    this.store = store ?? (statePath ? new JsonFileSnapshotStore(statePath) : new MemorySnapshotStore());
+    const baseStore = store ?? (statePath ? new JsonFileSnapshotStore(statePath) : new MemorySnapshotStore());
+    this.store = new MigratingSnapshotStore(baseStore, createClearinghouseMigrationRegistry());
     this.clock = clock;
     this.idGenerator = idGenerator;
     this.eventSource = eventSource;
@@ -138,6 +145,8 @@ export class Clearinghouse {
 
       const timestamp = this.#now();
       const capacity = positiveInteger(input?.capacity, 'capacity');
+      const reservationTtlSeconds = optionalPositiveInteger(input?.reservationTtlSeconds, 'reservationTtlSeconds');
+      if (reservationTtlSeconds !== null) this.#addSeconds(timestamp, reservationTtlSeconds, 'reservationTtlSeconds');
       const offer = {
         id: this.idGenerator(),
         assetId: asset.id,
@@ -149,6 +158,7 @@ export class Clearinghouse {
         remaining: capacity,
         windowStart: input?.windowStart ?? null,
         windowEnd: input?.windowEnd ?? null,
+        reservationTtlSeconds,
         metadata: input?.metadata ?? {},
         status: 'open',
         version: 1,
@@ -165,6 +175,7 @@ export class Clearinghouse {
         unit: offer.unit,
         capacity: offer.capacity,
         unitPrice: offer.unitPrice,
+        reservationTtlSeconds: offer.reservationTtlSeconds,
       });
       return offer;
     });
@@ -183,6 +194,10 @@ export class Clearinghouse {
       invariant(offer.status === 'open', 'CONFLICT', 'offer is not open');
       this.#expectVersion(offer, expectedVersion);
 
+      const timestamp = this.#now();
+      if (offer.windowEnd !== null) {
+        invariant(Date.parse(timestamp) < Date.parse(offer.windowEnd), 'OFFER_WINDOW_CLOSED', 'offer service window has ended');
+      }
       const quantity = positiveInteger(input?.quantity, 'quantity');
       invariant(quantity <= offer.remaining, 'INSUFFICIENT_CAPACITY', 'insufficient capacity', { remaining: offer.remaining });
       invariant(actorId !== offer.sellerId, 'INVALID_REQUEST', 'buyer and seller must be different participants');
@@ -190,10 +205,12 @@ export class Clearinghouse {
       offer.remaining -= quantity;
       offer.status = offer.remaining === 0 ? 'filled' : 'open';
       offer.version += 1;
-      offer.updatedAt = this.#now();
+      offer.updatedAt = timestamp;
 
-      const timestamp = this.#now();
       const total = { ...offer.unitPrice, amount: multiplyAmount(offer.unitPrice.amount, quantity) };
+      const fundingDueAt = offer.reservationTtlSeconds === null
+        ? null
+        : this.#addSeconds(timestamp, offer.reservationTtlSeconds, 'reservationTtlSeconds');
       const order = {
         id: this.idGenerator(),
         offerId: offer.id,
@@ -206,9 +223,11 @@ export class Clearinghouse {
         unitPrice: clone(offer.unitPrice),
         total,
         status: 'reserved',
+        fundingDueAt,
         funding: null,
         deliveryProof: null,
         settlement: null,
+        expiration: null,
         version: 1,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -221,6 +240,7 @@ export class Clearinghouse {
         sellerId: order.sellerId,
         quantity: order.quantity,
         total: order.total,
+        fundingDueAt: order.fundingDueAt,
       });
       return order;
     });
@@ -232,14 +252,20 @@ export class Clearinghouse {
       this.#expectVersion(order, expectedVersion);
       invariant(order.status === 'reserved', 'CONFLICT', 'order is not awaiting funding');
       invariant(actorId === order.buyerId, 'FORBIDDEN', 'only the buyer may fund the order');
+      const timestamp = this.#now();
+      if (order.fundingDueAt !== null) {
+        invariant(Date.parse(timestamp) < Date.parse(order.fundingDueAt), 'RESERVATION_EXPIRED', 'reservation funding deadline has passed', {
+          fundingDueAt: order.fundingDueAt,
+        });
+      }
       const reference = nonEmptyString(input?.reference, 'reference');
       const supplied = { ...order.total, amount: nonEmptyString(input?.amount, 'amount') };
       invariant(sameAmount(supplied, order.total), 'INVALID_REQUEST', 'funding amount must equal the order total');
 
-      order.funding = { amount: clone(order.total), reference, recordedAt: this.#now() };
+      order.funding = { amount: clone(order.total), reference, recordedAt: timestamp };
       order.status = 'funded';
       order.version += 1;
-      order.updatedAt = this.#now();
+      order.updatedAt = timestamp;
       this.#record('spaceeconomy.order.funded.v1', `order/${order.id}`, {
         orderId: order.id,
         buyerId: actorId,
@@ -315,18 +341,45 @@ export class Clearinghouse {
       this.#expectVersion(order, expectedVersion);
       invariant(order.status === 'reserved', 'CONFLICT', 'only an unfunded reservation may be cancelled');
       invariant(actorId === order.buyerId || actorId === order.sellerId, 'FORBIDDEN', 'actor is not a party to the order');
-      const offer = this.offers.get(order.offerId);
-      invariant(offer, 'CORRUPT_STATE', 'order references a missing offer');
-
-      offer.remaining += order.quantity;
-      invariant(offer.remaining <= offer.capacity, 'CORRUPT_STATE', 'offer capacity invariant violated');
-      offer.status = 'open';
-      offer.version += 1;
-      offer.updatedAt = this.#now();
+      const timestamp = this.#now();
+      this.#releaseReservation(order, timestamp);
       order.status = 'cancelled';
       order.version += 1;
-      order.updatedAt = this.#now();
+      order.updatedAt = timestamp;
       this.#record('spaceeconomy.order.cancelled.v1', `order/${order.id}`, { orderId: order.id, actorId });
+      return order;
+    });
+  }
+
+  expireOrder(orderId, context) {
+    return this.#command('order.expire', context, { orderId }, ({ actorId, expectedVersion }) => {
+      const order = this.#order(orderId);
+      this.#expectVersion(order, expectedVersion);
+      invariant(order.status === 'reserved', 'CONFLICT', 'only an unfunded reservation may expire');
+      invariant(order.fundingDueAt !== null, 'RESERVATION_NOT_EXPIRABLE', 'reservation has no funding deadline');
+      const timestamp = this.#now();
+      invariant(Date.parse(timestamp) >= Date.parse(order.fundingDueAt), 'RESERVATION_NOT_DUE', 'reservation funding deadline has not been reached', {
+        fundingDueAt: order.fundingDueAt,
+      });
+
+      this.#releaseReservation(order, timestamp);
+      order.status = 'expired';
+      order.version += 1;
+      order.updatedAt = timestamp;
+      order.expiration = {
+        reason: 'funding-deadline',
+        fundingDueAt: order.fundingDueAt,
+        expiredAt: timestamp,
+        triggeredBy: actorId,
+      };
+      this.#record('spaceeconomy.order.expired.v1', `order/${order.id}`, {
+        orderId: order.id,
+        offerId: order.offerId,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        fundingDueAt: order.fundingDueAt,
+        triggeredBy: actorId,
+      });
       return order;
     });
   }
@@ -420,6 +473,16 @@ export class Clearinghouse {
     });
   }
 
+  #releaseReservation(order, timestamp) {
+    const offer = this.offers.get(order.offerId);
+    invariant(offer, 'CORRUPT_STATE', 'order references a missing offer');
+    offer.remaining += order.quantity;
+    invariant(offer.remaining <= offer.capacity, 'CORRUPT_STATE', 'offer capacity invariant violated');
+    offer.status = 'open';
+    offer.version += 1;
+    offer.updatedAt = timestamp;
+  }
+
   #record(type, subject, data) {
     const previoushash = this.ledger.at(-1)?.hash ?? 'GENESIS';
     const unsigned = {
@@ -464,6 +527,14 @@ export class Clearinghouse {
     invariant(Number.isFinite(startMs) && Number.isFinite(endMs) && startMs < endMs, 'INVALID_REQUEST', 'offer window must have valid start < end');
   }
 
+  #addSeconds(timestamp, seconds, field) {
+    invariant(seconds <= Math.floor(Number.MAX_SAFE_INTEGER / 1000), 'INVALID_REQUEST', `${field} is too large`);
+    const milliseconds = Date.parse(timestamp) + (seconds * 1000);
+    const value = new Date(milliseconds);
+    invariant(Number.isFinite(value.getTime()), 'INVALID_REQUEST', `${field} produces an invalid funding deadline`);
+    return value.toISOString();
+  }
+
   #now() {
     const value = this.clock();
     invariant(value instanceof Date && Number.isFinite(value.getTime()), 'INVALID_CONFIGURATION', 'clock must return a valid Date');
@@ -472,7 +543,7 @@ export class Clearinghouse {
 
   #snapshot() {
     return {
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: CURRENT_SCHEMA_VERSION,
       revision: this.revision,
       assets: [...this.assets.values()].map((item) => clone(item)),
       offers: [...this.offers.values()].map((item) => clone(item)),
@@ -483,7 +554,7 @@ export class Clearinghouse {
   }
 
   #restore(state, { verify = true } = {}) {
-    invariant(state?.schemaVersion === SCHEMA_VERSION, 'UNSUPPORTED_SCHEMA', `unsupported state schema version: ${state?.schemaVersion ?? 'missing'}`);
+    invariant(state?.schemaVersion === CURRENT_SCHEMA_VERSION, 'UNSUPPORTED_SCHEMA', `unsupported state schema version: ${state?.schemaVersion ?? 'missing'}`);
     invariant(Number.isSafeInteger(state.revision) && state.revision >= 0, 'CORRUPT_STATE', 'state revision is invalid');
     this.assets = new Map((state.assets ?? []).map((item) => [item.id, item]));
     this.offers = new Map((state.offers ?? []).map((item) => [item.id, item]));

@@ -12,12 +12,15 @@ This repository is a zero-runtime-dependency Node.js reference implementation of
 - Publishes measurable service capacity without oversubscription.
 - Uses exact integer monetary arithmetic instead of floating-point prices.
 - Reserves orders with persisted idempotency for safe retries.
+- Supports seller-configured funding deadlines so unpaid holds can expire without imposing a global TTL.
+- Atomically returns capacity when a due unpaid reservation expires.
 - Tracks resource versions for optimistic concurrency.
 - Separates actor identity from request payloads.
 - Records funding references, delivery proofs, and settlement references.
-- Refuses financially unsafe transitions such as silently cancelling funded capacity.
+- Refuses financially unsafe transitions such as silently cancelling or expiring funded capacity.
 - Emits CloudEvents-compatible, RFC 8785-canonicalized SHA-256 ledger events.
 - Persists schema-versioned snapshots behind an asynchronous replaceable storage port.
+- Migrates historical persisted snapshots explicitly without rewriting ledger history.
 - Serializes local mutations and uses revision compare-and-swap for cross-instance races.
 - Exposes a versioned HTTP API with RFC 9457 errors and an OpenAPI 3.2 contract.
 
@@ -88,7 +91,7 @@ const asset = await market.registerAsset(
 console.log(asset.id);
 ```
 
-`Clearinghouse.open(options)` is the preferred construction path because it loads and validates persisted state before returning. Mutations are serialized within one instance; reads wait for mutations that were already enqueued, so callers do not observe uncommitted in-memory state.
+`Clearinghouse.open(options)` is the preferred construction path because it loads, migrates, and validates persisted state before returning. Mutations are serialized within one instance; reads wait for mutations that were already enqueued, so callers do not observe uncommitted in-memory state.
 
 ## API
 
@@ -104,6 +107,7 @@ POST /v1/orders/:id/fund
 POST /v1/orders/:id/deliver
 POST /v1/orders/:id/settle
 POST /v1/orders/:id/cancel
+POST /v1/orders/:id/expire
 GET  /v1/ledger
 ```
 
@@ -137,11 +141,12 @@ curl -X POST http://localhost:8787/v1/assets \
     "amount": "15",
     "scale": 2
   },
-  "capacity": 500000
+  "capacity": 500000,
+  "reservationTtlSeconds": 300
 }
 ```
 
-A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,000.00, with no floating-point multiplication.
+A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,000.00, with no floating-point multiplication. With the optional 300-second reservation TTL above, the order also receives an immutable `fundingDueAt`. At that deadline funding is rejected and an authenticated expiry worker may release the unpaid hold. Omitting the field preserves an unbounded reservation policy.
 
 ## Architecture
 
@@ -158,7 +163,7 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
           \          |           /
         CloudEvents-compatible event ledger
                     |
-          async snapshot store port
+      migration-aware async store port
               /             \
        memory/dev JSON    production DB
 
@@ -168,6 +173,8 @@ conjunction safety • disputes • insurance • auctions/RFQs
 ```
 
 The core storage contract is deliberately tiny: `await load()` and `await save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer; a production database adapter should enforce compare-and-swap transactionally. A lost cross-process race refreshes the in-memory instance from the winning snapshot before returning `STORE_CONFLICT`, so an application can retry against current state.
+
+Persisted schema v2 adds reservation-expiry fields through an explicit v1→v2 migration. Loading old state does not rewrite it; the migrated snapshot becomes durable only through a later successful normal mutation. See [`docs/MIGRATIONS.md`](docs/MIGRATIONS.md).
 
 ## Standards strategy
 
@@ -191,7 +198,7 @@ See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs
 3. Verifiable participant and asset-control credentials.
 4. Service-specific delivery-proof verifier interface.
 5. Settlement/custody adapters with refunds and disputes.
-6. Reservation expiry and time-window policy.
+6. Durable reservation-expiry scheduling/reconciliation above the objective kernel transition.
 7. RFQ/auction matching above the clearing kernel.
 8. CCSDS-backed orbit/conjunction policy gates.
 9. External ledger anchoring and receipt export.
