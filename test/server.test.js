@@ -4,8 +4,9 @@ import { Clearinghouse } from '../src/clearinghouse.js';
 import { createHttpServer } from '../src/server.js';
 
 async function withServer(run, serverOptions = {}) {
-  const market = new Clearinghouse();
-  const server = createHttpServer({ market, ...serverOptions });
+  const market = serverOptions.market ?? await Clearinghouse.open();
+  const { market: _market, ...httpOptions } = serverOptions;
+  const server = createHttpServer({ market, ...httpOptions });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -50,7 +51,7 @@ test('HTTP idempotency retries return the same created asset', async () => {
     const firstBody = await first.json();
     const secondBody = await second.json();
     assert.equal(firstBody.data.id, secondBody.data.id);
-    assert.equal(market.listAssets().length, 1);
+    assert.equal((await market.listAssets()).length, 1);
   });
 });
 
@@ -68,7 +69,7 @@ test('injected authenticator determines actor identity instead of caller headers
     assert.equal(response.status, 201);
     const body = await response.json();
     assert.equal(body.data.ownerId, 'verified-operator');
-    assert.equal(market.listAssets()[0].ownerId, 'verified-operator');
+    assert.equal((await market.listAssets())[0].ownerId, 'verified-operator');
   }, { authenticate });
 });
 
@@ -86,6 +87,39 @@ test('HTTP adapter rejects lookalike JSON media types', async () => {
     const body = await response.json();
     assert.equal(body.code, 'UNSUPPORTED_MEDIA_TYPE');
   });
+});
+
+test('reservation expiry is exposed as an authenticated optimistic-concurrency command', async () => {
+  let current = new Date('2026-08-26T20:00:00.000Z');
+  const market = await Clearinghouse.open({ clock: () => new Date(current) });
+  const asset = await market.registerAsset({ name: 'Relay', type: 'satellite' }, { actorId: 'seller' });
+  const offer = await market.createOffer({
+    assetId: asset.id,
+    service: 'relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '10', scale: 2 },
+    capacity: 10,
+    reservationTtlSeconds: 60,
+  }, { actorId: 'seller' });
+  const order = await market.createOrder({ offerId: offer.id, quantity: 4 }, { actorId: 'buyer' });
+  current = new Date('2026-08-26T20:01:00.000Z');
+
+  await withServer(async ({ baseUrl }) => {
+    const response = await fetch(`${baseUrl}/v1/orders/${order.id}/expire`, {
+      method: 'POST',
+      headers: {
+        'x-participant-id': 'expiry-worker',
+        'idempotency-key': 'expire-http-1',
+        'if-match': `"${order.version}"`,
+      },
+    });
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.data.status, 'expired');
+    assert.equal(body.data.expiration.triggeredBy, 'expiry-worker');
+  }, { market });
+
+  assert.equal((await market.listOffers())[0].remaining, 10);
 });
 
 test('versioned route surface and health endpoint are reachable', async () => {

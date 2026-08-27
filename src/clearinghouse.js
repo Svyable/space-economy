@@ -1,8 +1,9 @@
 import { randomUUID } from 'node:crypto';
 import { sha256Canonical } from './canonical-json.js';
+import { MigratingSnapshotStore } from './migrations.js';
+import { CURRENT_SCHEMA_VERSION, createClearinghouseMigrationRegistry } from './schema.js';
 import { JsonFileSnapshotStore, MemorySnapshotStore, StoreConflictError } from './store.js';
 
-const SCHEMA_VERSION = 1;
 const clone = (value) => structuredClone(value);
 const EVENT_SPEC_VERSION = '1.0';
 
@@ -27,6 +28,11 @@ function nonEmptyString(value, field) {
 function positiveInteger(value, field) {
   invariant(Number.isSafeInteger(value) && value > 0, 'INVALID_REQUEST', `${field} must be a positive safe integer`);
   return value;
+}
+
+function optionalPositiveInteger(value, field) {
+  if (value === null || value === undefined) return null;
+  return positiveInteger(value, field);
 }
 
 function normalizeUnitPrice(value) {
@@ -78,14 +84,24 @@ export class Clearinghouse {
     eventSource = 'urn:space-economy:clearinghouse',
   } = {}) {
     invariant(!(statePath && store), 'INVALID_CONFIGURATION', 'provide either statePath or store, not both');
-    this.store = store ?? (statePath ? new JsonFileSnapshotStore(statePath) : new MemorySnapshotStore());
+    const baseStore = store ?? (statePath ? new JsonFileSnapshotStore(statePath) : new MemorySnapshotStore());
+    this.store = new MigratingSnapshotStore(baseStore, createClearinghouseMigrationRegistry());
     this.clock = clock;
     this.idGenerator = idGenerator;
     this.eventSource = eventSource;
+    this.commandQueue = Promise.resolve();
     this.#initializeEmpty();
+    this.initialization = this.#loadPersisted();
+    this.initialization.catch(() => {});
+  }
 
-    const persisted = this.store.load();
-    if (persisted) this.#restore(persisted);
+  static async open(options = {}) {
+    return new Clearinghouse(options).ready();
+  }
+
+  async ready() {
+    await this.initialization;
+    return this;
   }
 
   registerAsset(input, context) {
@@ -117,7 +133,7 @@ export class Clearinghouse {
   }
 
   listAssets() {
-    return [...this.assets.values()].map((asset) => clone(asset));
+    return this.#read(() => [...this.assets.values()].map((asset) => clone(asset)));
   }
 
   createOffer(input, context) {
@@ -129,6 +145,8 @@ export class Clearinghouse {
 
       const timestamp = this.#now();
       const capacity = positiveInteger(input?.capacity, 'capacity');
+      const reservationTtlSeconds = optionalPositiveInteger(input?.reservationTtlSeconds, 'reservationTtlSeconds');
+      if (reservationTtlSeconds !== null) this.#addSeconds(timestamp, reservationTtlSeconds, 'reservationTtlSeconds');
       const offer = {
         id: this.idGenerator(),
         assetId: asset.id,
@@ -140,6 +158,7 @@ export class Clearinghouse {
         remaining: capacity,
         windowStart: input?.windowStart ?? null,
         windowEnd: input?.windowEnd ?? null,
+        reservationTtlSeconds,
         metadata: input?.metadata ?? {},
         status: 'open',
         version: 1,
@@ -156,15 +175,16 @@ export class Clearinghouse {
         unit: offer.unit,
         capacity: offer.capacity,
         unitPrice: offer.unitPrice,
+        reservationTtlSeconds: offer.reservationTtlSeconds,
       });
       return offer;
     });
   }
 
   listOffers({ service, status = 'open' } = {}) {
-    return [...this.offers.values()]
+    return this.#read(() => [...this.offers.values()]
       .filter((offer) => (!service || offer.service === service) && (!status || offer.status === status))
-      .map((offer) => clone(offer));
+      .map((offer) => clone(offer)));
   }
 
   createOrder(input, context) {
@@ -174,6 +194,10 @@ export class Clearinghouse {
       invariant(offer.status === 'open', 'CONFLICT', 'offer is not open');
       this.#expectVersion(offer, expectedVersion);
 
+      const timestamp = this.#now();
+      if (offer.windowEnd !== null) {
+        invariant(Date.parse(timestamp) < Date.parse(offer.windowEnd), 'OFFER_WINDOW_CLOSED', 'offer service window has ended');
+      }
       const quantity = positiveInteger(input?.quantity, 'quantity');
       invariant(quantity <= offer.remaining, 'INSUFFICIENT_CAPACITY', 'insufficient capacity', { remaining: offer.remaining });
       invariant(actorId !== offer.sellerId, 'INVALID_REQUEST', 'buyer and seller must be different participants');
@@ -181,10 +205,12 @@ export class Clearinghouse {
       offer.remaining -= quantity;
       offer.status = offer.remaining === 0 ? 'filled' : 'open';
       offer.version += 1;
-      offer.updatedAt = this.#now();
+      offer.updatedAt = timestamp;
 
-      const timestamp = this.#now();
       const total = { ...offer.unitPrice, amount: multiplyAmount(offer.unitPrice.amount, quantity) };
+      const fundingDueAt = offer.reservationTtlSeconds === null
+        ? null
+        : this.#addSeconds(timestamp, offer.reservationTtlSeconds, 'reservationTtlSeconds');
       const order = {
         id: this.idGenerator(),
         offerId: offer.id,
@@ -197,9 +223,11 @@ export class Clearinghouse {
         unitPrice: clone(offer.unitPrice),
         total,
         status: 'reserved',
+        fundingDueAt,
         funding: null,
         deliveryProof: null,
         settlement: null,
+        expiration: null,
         version: 1,
         createdAt: timestamp,
         updatedAt: timestamp,
@@ -212,6 +240,7 @@ export class Clearinghouse {
         sellerId: order.sellerId,
         quantity: order.quantity,
         total: order.total,
+        fundingDueAt: order.fundingDueAt,
       });
       return order;
     });
@@ -223,14 +252,20 @@ export class Clearinghouse {
       this.#expectVersion(order, expectedVersion);
       invariant(order.status === 'reserved', 'CONFLICT', 'order is not awaiting funding');
       invariant(actorId === order.buyerId, 'FORBIDDEN', 'only the buyer may fund the order');
+      const timestamp = this.#now();
+      if (order.fundingDueAt !== null) {
+        invariant(Date.parse(timestamp) < Date.parse(order.fundingDueAt), 'RESERVATION_EXPIRED', 'reservation funding deadline has passed', {
+          fundingDueAt: order.fundingDueAt,
+        });
+      }
       const reference = nonEmptyString(input?.reference, 'reference');
       const supplied = { ...order.total, amount: nonEmptyString(input?.amount, 'amount') };
       invariant(sameAmount(supplied, order.total), 'INVALID_REQUEST', 'funding amount must equal the order total');
 
-      order.funding = { amount: clone(order.total), reference, recordedAt: this.#now() };
+      order.funding = { amount: clone(order.total), reference, recordedAt: timestamp };
       order.status = 'funded';
       order.version += 1;
-      order.updatedAt = this.#now();
+      order.updatedAt = timestamp;
       this.#record('spaceeconomy.order.funded.v1', `order/${order.id}`, {
         orderId: order.id,
         buyerId: actorId,
@@ -306,45 +341,63 @@ export class Clearinghouse {
       this.#expectVersion(order, expectedVersion);
       invariant(order.status === 'reserved', 'CONFLICT', 'only an unfunded reservation may be cancelled');
       invariant(actorId === order.buyerId || actorId === order.sellerId, 'FORBIDDEN', 'actor is not a party to the order');
-      const offer = this.offers.get(order.offerId);
-      invariant(offer, 'CORRUPT_STATE', 'order references a missing offer');
-
-      offer.remaining += order.quantity;
-      invariant(offer.remaining <= offer.capacity, 'CORRUPT_STATE', 'offer capacity invariant violated');
-      offer.status = 'open';
-      offer.version += 1;
-      offer.updatedAt = this.#now();
+      const timestamp = this.#now();
+      this.#releaseReservation(order, timestamp);
       order.status = 'cancelled';
       order.version += 1;
-      order.updatedAt = this.#now();
+      order.updatedAt = timestamp;
       this.#record('spaceeconomy.order.cancelled.v1', `order/${order.id}`, { orderId: order.id, actorId });
       return order;
     });
   }
 
+  expireOrder(orderId, context) {
+    return this.#command('order.expire', context, { orderId }, ({ actorId, expectedVersion }) => {
+      const order = this.#order(orderId);
+      this.#expectVersion(order, expectedVersion);
+      invariant(order.status === 'reserved', 'CONFLICT', 'only an unfunded reservation may expire');
+      invariant(order.fundingDueAt !== null, 'RESERVATION_NOT_EXPIRABLE', 'reservation has no funding deadline');
+      const timestamp = this.#now();
+      invariant(Date.parse(timestamp) >= Date.parse(order.fundingDueAt), 'RESERVATION_NOT_DUE', 'reservation funding deadline has not been reached', {
+        fundingDueAt: order.fundingDueAt,
+      });
+
+      this.#releaseReservation(order, timestamp);
+      order.status = 'expired';
+      order.version += 1;
+      order.updatedAt = timestamp;
+      order.expiration = {
+        reason: 'funding-deadline',
+        fundingDueAt: order.fundingDueAt,
+        expiredAt: timestamp,
+        triggeredBy: actorId,
+      };
+      this.#record('spaceeconomy.order.expired.v1', `order/${order.id}`, {
+        orderId: order.id,
+        offerId: order.offerId,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        fundingDueAt: order.fundingDueAt,
+        triggeredBy: actorId,
+      });
+      return order;
+    });
+  }
+
   getOrder(orderId) {
-    return clone(this.#order(orderId));
+    return this.#read(() => clone(this.#order(orderId)));
   }
 
   getLedger() {
-    return clone(this.ledger);
+    return this.#read(() => clone(this.ledger));
   }
 
   getRevision() {
-    return this.revision;
+    return this.#read(() => this.revision);
   }
 
   verifyLedger() {
-    let previousHash = 'GENESIS';
-    for (let index = 0; index < this.ledger.length; index += 1) {
-      const entry = this.ledger[index];
-      const { hash, ...unsigned } = entry;
-      if (entry.sequence !== index + 1) return false;
-      if (entry.previoushash !== previousHash) return false;
-      if (`sha256:${sha256Canonical(unsigned)}` !== hash) return false;
-      previousHash = hash;
-    }
-    return true;
+    return this.#read(() => this.#verifyLedgerNow());
   }
 
   #initializeEmpty() {
@@ -356,36 +409,60 @@ export class Clearinghouse {
     this.revision = 0;
   }
 
+  async #loadPersisted() {
+    const persisted = await this.store.load();
+    if (persisted) this.#restore(persisted);
+  }
+
   #command(operation, rawContext, fingerprintData, mutator) {
-    const context = normalizeContext(rawContext);
-    const fingerprint = sha256Canonical({ operation, actorId: context.actorId, input: fingerprintData });
-    const idempotencyId = context.idempotencyKey ? `${context.actorId}\u0000${operation}\u0000${context.idempotencyKey}` : null;
+    const execute = async () => {
+      await this.initialization;
+      const context = normalizeContext(rawContext);
+      const fingerprint = sha256Canonical({ operation, actorId: context.actorId, input: fingerprintData });
+      const idempotencyId = context.idempotencyKey ? `${context.actorId}\u0000${operation}\u0000${context.idempotencyKey}` : null;
 
-    if (idempotencyId && this.idempotency.has(idempotencyId)) {
-      const prior = this.idempotency.get(idempotencyId);
-      invariant(prior.fingerprint === fingerprint, 'IDEMPOTENCY_CONFLICT', 'idempotency key was already used with a different request');
-      return clone(prior.result);
-    }
-
-    const before = this.#snapshot();
-    const expectedRevision = this.revision;
-    try {
-      const result = mutator(context);
-      this.revision += 1;
-      if (idempotencyId) {
-        this.idempotency.set(idempotencyId, {
-          fingerprint,
-          result: clone(result),
-          createdAt: this.#now(),
-        });
+      if (idempotencyId && this.idempotency.has(idempotencyId)) {
+        const prior = this.idempotency.get(idempotencyId);
+        invariant(prior.fingerprint === fingerprint, 'IDEMPOTENCY_CONFLICT', 'idempotency key was already used with a different request');
+        return clone(prior.result);
       }
-      this.store.save(this.#snapshot(), { expectedRevision });
-      return clone(result);
-    } catch (error) {
-      this.#restore(before, { verify: false });
-      if (error instanceof StoreConflictError) throw new DomainError('STORE_CONFLICT', 'state changed concurrently; retry the command');
-      throw error;
-    }
+
+      const before = this.#snapshot();
+      const expectedRevision = this.revision;
+      try {
+        const result = await mutator(context);
+        this.revision += 1;
+        if (idempotencyId) {
+          this.idempotency.set(idempotencyId, {
+            fingerprint,
+            result: clone(result),
+            createdAt: this.#now(),
+          });
+        }
+        await this.store.save(this.#snapshot(), { expectedRevision });
+        return clone(result);
+      } catch (error) {
+        this.#restore(before, { verify: false });
+        if (error instanceof StoreConflictError) {
+          const latest = await this.store.load();
+          if (latest) this.#restore(latest);
+          else this.#initializeEmpty();
+          throw new DomainError('STORE_CONFLICT', 'state changed concurrently; retry the command');
+        }
+        throw error;
+      }
+    };
+
+    const pending = this.commandQueue.then(execute);
+    this.commandQueue = pending.then(() => undefined, () => undefined);
+    return pending;
+  }
+
+  async #read(reader) {
+    await this.initialization;
+    const pendingCommands = this.commandQueue;
+    await pendingCommands;
+    return reader();
   }
 
   #expectVersion(resource, expectedVersion) {
@@ -394,6 +471,16 @@ export class Clearinghouse {
       expectedVersion,
       actualVersion: resource.version,
     });
+  }
+
+  #releaseReservation(order, timestamp) {
+    const offer = this.offers.get(order.offerId);
+    invariant(offer, 'CORRUPT_STATE', 'order references a missing offer');
+    offer.remaining += order.quantity;
+    invariant(offer.remaining <= offer.capacity, 'CORRUPT_STATE', 'offer capacity invariant violated');
+    offer.status = 'open';
+    offer.version += 1;
+    offer.updatedAt = timestamp;
   }
 
   #record(type, subject, data) {
@@ -413,6 +500,19 @@ export class Clearinghouse {
     this.ledger.push({ ...unsigned, hash: `sha256:${sha256Canonical(unsigned)}` });
   }
 
+  #verifyLedgerNow() {
+    let previousHash = 'GENESIS';
+    for (let index = 0; index < this.ledger.length; index += 1) {
+      const entry = this.ledger[index];
+      const { hash, ...unsigned } = entry;
+      if (entry.sequence !== index + 1) return false;
+      if (entry.previoushash !== previousHash) return false;
+      if (`sha256:${sha256Canonical(unsigned)}` !== hash) return false;
+      previousHash = hash;
+    }
+    return true;
+  }
+
   #order(id) {
     const order = this.orders.get(id);
     invariant(order, 'NOT_FOUND', 'order not found');
@@ -427,6 +527,14 @@ export class Clearinghouse {
     invariant(Number.isFinite(startMs) && Number.isFinite(endMs) && startMs < endMs, 'INVALID_REQUEST', 'offer window must have valid start < end');
   }
 
+  #addSeconds(timestamp, seconds, field) {
+    invariant(seconds <= Math.floor(Number.MAX_SAFE_INTEGER / 1000), 'INVALID_REQUEST', `${field} is too large`);
+    const milliseconds = Date.parse(timestamp) + (seconds * 1000);
+    const value = new Date(milliseconds);
+    invariant(Number.isFinite(value.getTime()), 'INVALID_REQUEST', `${field} produces an invalid funding deadline`);
+    return value.toISOString();
+  }
+
   #now() {
     const value = this.clock();
     invariant(value instanceof Date && Number.isFinite(value.getTime()), 'INVALID_CONFIGURATION', 'clock must return a valid Date');
@@ -435,7 +543,7 @@ export class Clearinghouse {
 
   #snapshot() {
     return {
-      schemaVersion: SCHEMA_VERSION,
+      schemaVersion: CURRENT_SCHEMA_VERSION,
       revision: this.revision,
       assets: [...this.assets.values()].map((item) => clone(item)),
       offers: [...this.offers.values()].map((item) => clone(item)),
@@ -446,7 +554,7 @@ export class Clearinghouse {
   }
 
   #restore(state, { verify = true } = {}) {
-    invariant(state?.schemaVersion === SCHEMA_VERSION, 'UNSUPPORTED_SCHEMA', `unsupported state schema version: ${state?.schemaVersion ?? 'missing'}`);
+    invariant(state?.schemaVersion === CURRENT_SCHEMA_VERSION, 'UNSUPPORTED_SCHEMA', `unsupported state schema version: ${state?.schemaVersion ?? 'missing'}`);
     invariant(Number.isSafeInteger(state.revision) && state.revision >= 0, 'CORRUPT_STATE', 'state revision is invalid');
     this.assets = new Map((state.assets ?? []).map((item) => [item.id, item]));
     this.offers = new Map((state.offers ?? []).map((item) => [item.id, item]));
@@ -454,6 +562,6 @@ export class Clearinghouse {
     this.ledger = state.ledger ?? [];
     this.idempotency = new Map(state.idempotency ?? []);
     this.revision = state.revision;
-    if (verify) invariant(this.verifyLedger(), 'CORRUPT_STATE', 'persisted ledger failed integrity verification');
+    if (verify) invariant(this.#verifyLedgerNow(), 'CORRUPT_STATE', 'persisted ledger failed integrity verification');
   }
 }

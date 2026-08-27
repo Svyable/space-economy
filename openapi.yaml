@@ -190,6 +190,18 @@ paths:
       responses:
         '200': { $ref: '#/components/responses/OrderResponse' }
         default: { $ref: '#/components/responses/Problem' }
+  /v1/orders/{orderId}/expire:
+    post:
+      operationId: expireOrder
+      description: Release a seller-configured unpaid reservation once its funding deadline has been reached. Any authenticated actor may trigger this objective transition.
+      parameters:
+        - $ref: '#/components/parameters/OrderId'
+        - $ref: '#/components/parameters/Actor'
+        - $ref: '#/components/parameters/IdempotencyKey'
+        - $ref: '#/components/parameters/IfMatch'
+      responses:
+        '200': { $ref: '#/components/responses/OrderResponse' }
+        default: { $ref: '#/components/responses/Problem' }
   /v1/ledger:
     get:
       operationId: getLedger
@@ -277,12 +289,16 @@ components:
         capacity: { type: integer, minimum: 1 }
         windowStart: { type: [string, 'null'], format: date-time }
         windowEnd: { type: [string, 'null'], format: date-time }
+        reservationTtlSeconds:
+          type: [integer, 'null']
+          minimum: 1
+          description: Optional seller-configured funding deadline duration for new reservations. Null means no automatic reservation expiry policy.
         metadata: { type: object, additionalProperties: true }
     Offer:
       allOf:
         - $ref: '#/components/schemas/CreateOffer'
         - type: object
-          required: [id, sellerId, remaining, status, version, createdAt, updatedAt]
+          required: [id, sellerId, remaining, reservationTtlSeconds, status, version, createdAt, updatedAt]
           properties:
             id: { type: string }
             sellerId: { type: string }
@@ -291,10 +307,18 @@ components:
             version: { type: integer, minimum: 1 }
             createdAt: { type: string, format: date-time }
             updatedAt: { type: string, format: date-time }
+    Expiration:
+      type: [object, 'null']
+      required: [reason, fundingDueAt, expiredAt, triggeredBy]
+      properties:
+        reason: { type: string, const: funding-deadline }
+        fundingDueAt: { type: string, format: date-time }
+        expiredAt: { type: string, format: date-time }
+        triggeredBy: { type: string }
     Order:
       type: object
       additionalProperties: true
-      required: [id, offerId, assetId, sellerId, buyerId, quantity, total, status, version]
+      required: [id, offerId, assetId, sellerId, buyerId, quantity, total, status, fundingDueAt, expiration, version]
       properties:
         id: { type: string }
         offerId: { type: string }
@@ -303,7 +327,12 @@ components:
         buyerId: { type: string }
         quantity: { type: integer, minimum: 1 }
         total: { $ref: '#/components/schemas/UnitPrice' }
-        status: { type: string, enum: [reserved, funded, delivered, settled, cancelled] }
+        status: { type: string, enum: [reserved, funded, delivered, settled, cancelled, expired] }
+        fundingDueAt:
+          type: [string, 'null']
+          format: date-time
+          description: Materialized funding deadline inherited from the offer at reservation time. Null means the reservation is unbounded by TTL.
+        expiration: { $ref: '#/components/schemas/Expiration' }
         version: { type: integer, minimum: 1 }
     LedgerEvent:
       type: object
