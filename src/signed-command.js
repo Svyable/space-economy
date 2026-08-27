@@ -3,6 +3,22 @@ import { canonicalize, sha256Canonical } from './canonical-json.js';
 
 const DOMAIN = 'space-economy.command.v1';
 const SCHEMA = 'spaceeconomy.command.v1';
+const RFC3339 = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d{1,9})?(?:Z|[+-]\d{2}:\d{2})$/;
+const ENVELOPE_FIELDS = new Set([
+  'schema',
+  'algorithm',
+  'keyId',
+  'actorId',
+  'audience',
+  'operation',
+  'nonce',
+  'idempotencyKey',
+  'expectedVersion',
+  'createdAt',
+  'expiresAt',
+  'payload',
+  'signature',
+]);
 
 export class SignedCommandError extends Error {
   constructor(code, message, details = undefined) {
@@ -24,8 +40,9 @@ function nonEmptyString(value, field) {
 
 function timestamp(value, field) {
   const normalized = nonEmptyString(value, field);
+  invariant(RFC3339.test(normalized), 'INVALID_COMMAND', `${field} must be an RFC 3339 timestamp`);
   const milliseconds = Date.parse(normalized);
-  invariant(Number.isFinite(milliseconds), 'INVALID_COMMAND', `${field} must be an RFC 3339 timestamp`);
+  invariant(Number.isFinite(milliseconds), 'INVALID_COMMAND', `${field} must be a valid RFC 3339 timestamp`);
   return { value: new Date(milliseconds).toISOString(), milliseconds };
 }
 
@@ -104,6 +121,8 @@ export async function verifyCommand(envelope, {
   invariant(Number.isSafeInteger(maxLifetimeSeconds) && maxLifetimeSeconds > 0, 'INVALID_CONFIGURATION', 'maxLifetimeSeconds must be a positive safe integer');
 
   invariant(envelope && typeof envelope === 'object' && !Array.isArray(envelope), 'INVALID_COMMAND', 'command envelope must be an object');
+  const unexpectedFields = Object.keys(envelope).filter((field) => !ENVELOPE_FIELDS.has(field));
+  invariant(unexpectedFields.length === 0, 'UNSIGNED_EXTENSION', 'command envelope contains unsupported unsigned fields', { fields: unexpectedFields });
   invariant(envelope.schema === SCHEMA, 'UNSUPPORTED_COMMAND_SCHEMA', `unsupported command schema: ${envelope.schema ?? 'missing'}`);
   invariant(envelope.algorithm === 'Ed25519', 'UNSUPPORTED_SIGNATURE_ALGORITHM', `unsupported signature algorithm: ${envelope.algorithm ?? 'missing'}`);
 
