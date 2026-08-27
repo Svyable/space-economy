@@ -7,7 +7,8 @@
   "exports": {
     ".": "./src/clearinghouse.js",
     "./canonical-json": "./src/canonical-json.js",
-    "./store": "./src/store.js"
+    "./store": "./src/store.js",
+    "./postgres-store": "./src/postgres-store.js"
   },
   "scripts": {
     "start": "node src/server.js",

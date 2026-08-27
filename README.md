@@ -22,6 +22,7 @@ This repository is a zero-runtime-dependency Node.js reference implementation of
 - Persists schema-versioned snapshots behind an asynchronous replaceable storage port.
 - Migrates historical persisted snapshots explicitly without rewriting ledger history.
 - Serializes local mutations and uses revision compare-and-swap for cross-instance races.
+- Provides a transactionally CAS-protected PostgreSQL adapter without making a database driver a runtime dependency.
 - Exposes a versioned HTTP API with RFC 9457 errors and an OpenAPI 3.2 contract.
 
 ## What it deliberately does not pretend to do
@@ -92,6 +93,25 @@ console.log(asset.id);
 ```
 
 `Clearinghouse.open(options)` is the preferred construction path because it loads, migrates, and validates persisted state before returning. Mutations are serialized within one instance; reads wait for mutations that were already enqueued, so callers do not observe uncommitted in-memory state.
+
+### PostgreSQL persistence
+
+`PostgresSnapshotStore` accepts a standard pool interface instead of importing a driver itself:
+
+```js
+import pg from 'pg';
+import { Clearinghouse } from './src/clearinghouse.js';
+import { PostgresSnapshotStore } from './src/postgres-store.js';
+
+const { Pool } = pg;
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const store = new PostgresSnapshotStore(pool, { storeKey: 'production-market' });
+await store.ensureSchema();
+
+const market = await Clearinghouse.open({ store });
+```
+
+The adapter uses a PostgreSQL transaction, a per-store advisory lock, row locking, and expected-revision comparison so two application instances cannot both commit from the same revision. See [`docs/POSTGRES.md`](docs/POSTGRES.md) for deployment, DDL, failure, and operational guidance.
 
 ## API
 
@@ -165,14 +185,14 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
                     |
       migration-aware async store port
               /             \
-       memory/dev JSON    production DB
+       memory/dev JSON     PostgreSQL
 
 External policy/adapters:
 identity • credentials • payments • proof verification • compliance
 conjunction safety • disputes • insurance • auctions/RFQs
 ```
 
-The core storage contract is deliberately tiny: `await load()` and `await save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer; a production database adapter should enforce compare-and-swap transactionally. A lost cross-process race refreshes the in-memory instance from the winning snapshot before returning `STORE_CONFLICT`, so an application can retry against current state.
+The core storage contract is deliberately tiny: `await load()` and `await save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer. `PostgresSnapshotStore` moves the same contract into a real transaction with cross-process locking and revision CAS. A lost race refreshes the clearinghouse instance from the winning snapshot before returning `STORE_CONFLICT`, so an application can retry against current state.
 
 Persisted schema v2 adds reservation-expiry fields through an explicit v1→v2 migration. Loading old state does not rewrite it; the migrated snapshot becomes durable only through a later successful normal mutation. See [`docs/MIGRATIONS.md`](docs/MIGRATIONS.md).
 
@@ -193,7 +213,7 @@ See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs
 
 ## Near-term roadmap
 
-1. Production database adapter implementing atomic revision compare-and-swap on the async store port.
+1. Database deployment hardening: migration rollout, backup/restore drills, observability, and read-model projections.
 2. Production authentication adapters and signed-request profiles.
 3. Verifiable participant and asset-control credentials.
 4. Service-specific delivery-proof verifier interface.
