@@ -10,8 +10,9 @@ function identifier(value, field) {
   return value;
 }
 
-function nonEmptyString(value, field) {
+function postgresText(value, field) {
   if (typeof value !== 'string' || value.length === 0) throw new TypeError(`${field} is required`);
+  if (value.includes('\u0000')) throw new TypeError(`${field} must not contain NUL`);
   return value;
 }
 
@@ -45,9 +46,9 @@ export class PostgresSnapshotStore {
     this.pool = pool;
     this.schema = identifier(schema, 'schema');
     this.table = identifier(table, 'table');
-    this.storeKey = nonEmptyString(storeKey, 'storeKey');
+    this.storeKey = postgresText(storeKey, 'storeKey');
     this.qualifiedTable = `"${this.schema}"."${this.table}"`;
-    this.lockKey = `${this.schema}.${this.table}\u0000${this.storeKey}`;
+    this.lockKey = JSON.stringify([this.schema, this.table, this.storeKey]);
   }
 
   async ensureSchema() {
@@ -55,8 +56,9 @@ export class PostgresSnapshotStore {
       CREATE TABLE IF NOT EXISTS ${this.qualifiedTable} (
         store_key TEXT PRIMARY KEY,
         revision BIGINT NOT NULL CHECK (revision >= 0),
-        snapshot JSONB NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
+        snapshot JSONB NOT NULL CHECK (snapshot ? 'revision'),
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+        CHECK ((snapshot->>'revision')::BIGINT = revision)
       )
     `);
   }
