@@ -6,6 +6,14 @@ The thesis: launch, communications, sensing, power, docking, logistics, compute,
 
 This repository is a zero-runtime-dependency Node.js reference implementation of that kernel.
 
+## For agents
+
+If you are an AI coding or research agent, start with [`AGENTS.md`](AGENTS.md). It maps the architecture, invariants, tests, and trust boundaries.
+
+If you are looking for reusable expertise for a task involving **space-economy infrastructure, orbital capacity markets, space logistics, asset registries, booking/reservations, delivery proofs, settlement coordination, or autonomous market agents**, use the Agent Skill at [`.agents/skills/space-economy-clearinghouse/SKILL.md`](.agents/skills/space-economy-clearinghouse/SKILL.md).
+
+The repository also contains a ready-to-submit GitHub Agent Finder catalog entry at [`distribution/github-agentfinder/space-economy-clearinghouse.json`](distribution/github-agentfinder/space-economy-clearinghouse.json). See [`docs/AGENT_DISCOVERY.md`](docs/AGENT_DISCOVERY.md) for the Agent Skills, ARD, A2A, MCP, and registry strategy.
+
 ## What the kernel does
 
 - Registers economically useful physical assets with extensible external identifiers.
@@ -22,11 +30,14 @@ This repository is a zero-runtime-dependency Node.js reference implementation of
 - Persists schema-versioned snapshots behind an asynchronous replaceable storage port.
 - Migrates historical persisted snapshots explicitly without rewriting ledger history.
 - Serializes local mutations and uses revision compare-and-swap for cross-instance races.
+- Provides typed, attributable delivery-proof verifier profiles.
+- Provides provider-neutral external settlement adapter contracts.
+- Provides attributable pre-command policy gates for deployment rules.
 - Exposes a versioned HTTP API with RFC 9457 errors and an OpenAPI 3.2 contract.
 
 ## What it deliberately does not pretend to do
 
-The reference server does **not** authenticate participants, custody funds, verify telemetry, prove spacecraft ownership, run conjunction assessment, perform KYC/KYB, or satisfy export-control/licensing requirements. Those are explicit adapter and policy boundaries, not hidden TODOs.
+The reference server does **not** authenticate participants, custody funds, independently verify arbitrary telemetry, prove spacecraft ownership, run conjunction assessment, perform KYC/KYB, or satisfy export-control/licensing requirements. Those are explicit adapter and policy boundaries, not hidden TODOs.
 
 Read [`SECURITY.md`](SECURITY.md) before deploying anything beyond local development.
 
@@ -92,6 +103,18 @@ console.log(asset.id);
 ```
 
 `Clearinghouse.open(options)` is the preferred construction path because it loads, migrates, and validates persisted state before returning. Mutations are serialized within one instance; reads wait for mutations that were already enqueued, so callers do not observe uncommitted in-memory state.
+
+Supported package entry points include:
+
+```text
+space-economy-clearinghouse
+space-economy-clearinghouse/canonical-json
+space-economy-clearinghouse/store
+space-economy-clearinghouse/migrations
+space-economy-clearinghouse/policy
+space-economy-clearinghouse/proofs
+space-economy-clearinghouse/settlement
+```
 
 ## API
 
@@ -187,20 +210,22 @@ The project uses or targets existing interoperability standards rather than repl
 - OpenAPI 3.2.0 for the HTTP contract;
 - ISO 4217 namespacing for fiat settlement assets;
 - CCSDS Orbit Data Messages and Conjunction Data Messages at space-data boundaries;
-- W3C DID / Verifiable Credentials as optional identity and credential adapters.
+- W3C DID / Verifiable Credentials as optional identity and credential adapters;
+- Agent Skills and `AGENTS.md` for portable agent-facing repository expertise;
+- Agentic Resource Discovery (ARD) as the planned web-scale discovery layer once a publisher-controlled domain is available.
 
-See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md) for the production identity boundary, and [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for invariants and trust boundaries.
+See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md) for the production identity boundary, [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for invariants and trust boundaries, and [`docs/AGENT_DISCOVERY.md`](docs/AGENT_DISCOVERY.md) for agent discoverability.
 
 ## Near-term roadmap
 
-1. Production database adapter implementing atomic revision compare-and-swap on the async store port.
-2. Production authentication adapters and signed-request profiles.
-3. Verifiable participant and asset-control credentials.
-4. Service-specific delivery-proof verifier interface.
-5. Settlement/custody adapters with refunds and disputes.
-6. Durable reservation-expiry scheduling/reconciliation above the objective kernel transition.
-7. RFQ/auction matching above the clearing kernel.
-8. CCSDS-backed orbit/conjunction policy gates.
+1. Production PostgreSQL adapter implementing atomic revision compare-and-swap on the async store port.
+2. Signed command envelopes and a verified-command execution pipeline for asynchronous/intermittent links.
+3. Portable participant, licensing, asset-control, and insurance credential adapters.
+4. Durable reservation-expiry scheduling/reconciliation above the objective kernel transition.
+5. Durable settlement/proof orchestration and reconciliation workflows.
+6. RFQ/auction matching above the clearing kernel.
+7. CCSDS-backed orbit/conjunction policy gate implementations.
+8. Hosted ARD publication plus MCP/A2A adapters where actual runtime use cases justify them.
 9. External ledger anchoring and receipt export.
 
-The long-term goal is not one marketplace. It is a transaction substrate that many independent space businesses can compose around.
+The long-term goal is not one marketplace. It is a transaction substrate that many independent space businesses and autonomous agents can compose around.

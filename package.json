@@ -3,11 +3,35 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Open coordination and settlement primitives for the space economy.",
+  "description": "Open transaction and settlement primitives for orbital capacity, space logistics, asset registries, and scarce physical capability markets.",
+  "keywords": [
+    "space-economy",
+    "orbital-economy",
+    "space-logistics",
+    "clearinghouse",
+    "capacity-market",
+    "asset-registry",
+    "settlement",
+    "delivery-proof",
+    "agent-skill",
+    "openapi"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Svyable/space-economy.git"
+  },
+  "homepage": "https://github.com/Svyable/space-economy#readme",
+  "bugs": {
+    "url": "https://github.com/Svyable/space-economy/issues"
+  },
   "exports": {
     ".": "./src/clearinghouse.js",
     "./canonical-json": "./src/canonical-json.js",
-    "./store": "./src/store.js"
+    "./store": "./src/store.js",
+    "./migrations": "./src/migrations.js",
+    "./policy": "./src/policy.js",
+    "./proofs": "./src/proofs.js",
+    "./settlement": "./src/settlement.js"
   },
   "scripts": {
     "start": "node src/server.js",
