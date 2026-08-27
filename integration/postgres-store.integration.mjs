@@ -10,11 +10,12 @@ const connectionString = process.env.DATABASE_URL;
 if (!connectionString) throw new Error('DATABASE_URL is required for Postgres integration tests');
 const pool = new Pool({ connectionString, max: 8 });
 
-const createStore = async (storeKey = `test-${randomUUID()}`, customPool = pool) => {
-  const store = new PostgresSnapshotStore(customPool, { storeKey });
-  await store.ensureSchema();
-  return store;
-};
+const bootstrapStore = new PostgresSnapshotStore(pool, { storeKey: 'integration-bootstrap' });
+await bootstrapStore.ensureSchema();
+
+const createStore = async (storeKey = `test-${randomUUID()}`, customPool = pool) => (
+  new PostgresSnapshotStore(customPool, { storeKey })
+);
 
 const snapshot = (revision, extra = {}) => ({
   schemaVersion: 1,
