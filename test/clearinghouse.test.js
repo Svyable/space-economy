@@ -8,6 +8,14 @@ import { MemorySnapshotStore } from '../src/store.js';
 
 const ctx = (actorId, extra = {}) => ({ actorId, ...extra });
 
+function controlledClock(initial) {
+  let current = new Date(initial);
+  return {
+    clock: () => new Date(current),
+    set(value) { current = new Date(value); },
+  };
+}
+
 async function fixture(options = {}) {
   const market = await Clearinghouse.open(options);
   const asset = await market.registerAsset({
@@ -201,4 +209,122 @@ test('cross-instance CAS conflicts refresh the loser so a retry can succeed', as
   await right.registerAsset({ name: 'Right', type: 'satellite' }, ctx('right-owner'));
   assert.equal((await right.listAssets()).length, 2);
   assert.equal(await right.getRevision(), 2);
+});
+
+test('seller-configured reservation TTL materializes a funding deadline', async () => {
+  const time = controlledClock('2026-08-26T20:00:00.000Z');
+  const market = await Clearinghouse.open({ clock: time.clock });
+  const asset = await market.registerAsset({ name: 'Relay', type: 'satellite' }, ctx('seller'));
+  const offer = await market.createOffer({
+    assetId: asset.id,
+    service: 'relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '10', scale: 2 },
+    capacity: 100,
+    reservationTtlSeconds: 60,
+  }, ctx('seller'));
+  const order = await market.createOrder({ offerId: offer.id, quantity: 10 }, ctx('buyer'));
+
+  assert.equal(offer.reservationTtlSeconds, 60);
+  assert.equal(order.fundingDueAt, '2026-08-26T20:01:00.000Z');
+  assert.equal(order.expiration, null);
+
+  time.set('2026-08-26T20:00:59.999Z');
+  const funded = await market.fundOrder(order.id, { amount: '100', reference: 'funding:before-deadline' }, ctx('buyer'));
+  assert.equal(funded.status, 'funded');
+});
+
+test('late funding is blocked and any authenticated actor may trigger objective expiry', async () => {
+  const time = controlledClock('2026-08-26T20:00:00.000Z');
+  const market = await Clearinghouse.open({ clock: time.clock });
+  const asset = await market.registerAsset({ name: 'Relay', type: 'satellite' }, ctx('seller'));
+  const offer = await market.createOffer({
+    assetId: asset.id,
+    service: 'relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '10', scale: 2 },
+    capacity: 100,
+    reservationTtlSeconds: 60,
+  }, ctx('seller'));
+  const order = await market.createOrder({ offerId: offer.id, quantity: 25 }, ctx('buyer'));
+  assert.equal((await market.listOffers())[0].remaining, 75);
+
+  time.set('2026-08-26T20:01:00.000Z');
+  await assert.rejects(
+    market.fundOrder(order.id, { amount: '250', reference: 'too-late' }, ctx('buyer')),
+    (error) => error.code === 'RESERVATION_EXPIRED' && error.details.fundingDueAt === order.fundingDueAt,
+  );
+
+  const expired = await market.expireOrder(order.id, ctx('expiry-worker', { expectedVersion: order.version, idempotencyKey: 'expire-1' }));
+  assert.equal(expired.status, 'expired');
+  assert.deepEqual(expired.expiration, {
+    reason: 'funding-deadline',
+    fundingDueAt: '2026-08-26T20:01:00.000Z',
+    expiredAt: '2026-08-26T20:01:00.000Z',
+    triggeredBy: 'expiry-worker',
+  });
+  const currentOffer = (await market.listOffers())[0];
+  assert.equal(currentOffer.remaining, 100);
+  assert.equal(currentOffer.status, 'open');
+  assert.equal(await market.verifyLedger(), true);
+  assert.equal((await market.getLedger()).at(-1).type, 'spaceeconomy.order.expired.v1');
+});
+
+test('expiry cannot be triggered early and no-TTL offers remain unbounded', async () => {
+  const time = controlledClock('2026-08-26T20:00:00.000Z');
+  const market = await Clearinghouse.open({ clock: time.clock });
+  const asset = await market.registerAsset({ name: 'Relay', type: 'satellite' }, ctx('seller'));
+  const bounded = await market.createOffer({
+    assetId: asset.id,
+    service: 'relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '10', scale: 2 },
+    capacity: 100,
+    reservationTtlSeconds: 60,
+  }, ctx('seller'));
+  const boundedOrder = await market.createOrder({ offerId: bounded.id, quantity: 10 }, ctx('buyer-a'));
+  time.set('2026-08-26T20:00:59.999Z');
+  await assert.rejects(
+    market.expireOrder(boundedOrder.id, ctx('worker')),
+    (error) => error.code === 'RESERVATION_NOT_DUE',
+  );
+
+  const unbounded = await market.createOffer({
+    assetId: asset.id,
+    service: 'storage',
+    unit: 'MB-hour',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '1', scale: 2 },
+    capacity: 100,
+  }, ctx('seller'));
+  const unboundedOrder = await market.createOrder({ offerId: unbounded.id, quantity: 1 }, ctx('buyer-b'));
+  assert.equal(unboundedOrder.fundingDueAt, null);
+  time.set('2030-01-01T00:00:00.000Z');
+  await assert.rejects(
+    market.expireOrder(unboundedOrder.id, ctx('worker')),
+    (error) => error.code === 'RESERVATION_NOT_EXPIRABLE',
+  );
+});
+
+test('service window end prevents creating new reservations without imposing a global TTL', async () => {
+  const time = controlledClock('2026-08-26T20:30:00.000Z');
+  const market = await Clearinghouse.open({ clock: time.clock });
+  const asset = await market.registerAsset({ name: 'Telescope', type: 'telescope' }, ctx('seller'));
+  const offer = await market.createOffer({
+    assetId: asset.id,
+    service: 'observation',
+    unit: 'second',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '5', scale: 2 },
+    capacity: 100,
+    windowStart: '2026-08-26T20:00:00.000Z',
+    windowEnd: '2026-08-26T21:00:00.000Z',
+  }, ctx('seller'));
+
+  const order = await market.createOrder({ offerId: offer.id, quantity: 1 }, ctx('buyer-a'));
+  assert.equal(order.fundingDueAt, null);
+
+  time.set('2026-08-26T21:00:00.000Z');
+  await assert.rejects(
+    market.createOrder({ offerId: offer.id, quantity: 1 }, ctx('buyer-b')),
+    (error) => error.code === 'OFFER_WINDOW_CLOSED',
+  );
 });

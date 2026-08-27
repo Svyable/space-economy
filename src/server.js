@@ -90,6 +90,10 @@ const statusByCode = {
   CONFLICT: 409,
   IDEMPOTENCY_CONFLICT: 409,
   INSUFFICIENT_CAPACITY: 409,
+  OFFER_WINDOW_CLOSED: 409,
+  RESERVATION_EXPIRED: 409,
+  RESERVATION_NOT_EXPIRABLE: 409,
+  RESERVATION_NOT_DUE: 409,
   STALE_VERSION: 412,
   STORE_CONFLICT: 409,
   UNSUPPORTED_MEDIA_TYPE: 415,
@@ -129,12 +133,13 @@ async function route(req, res, requestId, market, maxBodyBytes, authenticate) {
   if (req.method === 'POST' && parts[0] === 'v1' && parts[1] === 'orders' && parts.length === 4) {
     const orderId = parts[2];
     const action = parts[3];
-    const body = action === 'cancel' ? {} : await readBody(req, maxBodyBytes);
+    const body = action === 'cancel' || action === 'expire' ? {} : await readBody(req, maxBodyBytes);
     const commandContext = await requestContext(req, authenticate);
     if (action === 'fund') return json(res, 200, { data: await market.fundOrder(orderId, body, commandContext) }, { 'x-request-id': requestId });
     if (action === 'deliver') return json(res, 200, { data: await market.recordDelivery(orderId, body, commandContext) }, { 'x-request-id': requestId });
     if (action === 'settle') return json(res, 200, { data: await market.settleOrder(orderId, body, commandContext) }, { 'x-request-id': requestId });
     if (action === 'cancel') return json(res, 200, { data: await market.cancelOrder(orderId, commandContext) }, { 'x-request-id': requestId });
+    if (action === 'expire') return json(res, 200, { data: await market.expireOrder(orderId, commandContext) }, { 'x-request-id': requestId });
   }
   if (req.method === 'GET' && url.pathname === '/v1/ledger') {
     const [valid, data] = await Promise.all([market.verifyLedger(), market.getLedger()]);

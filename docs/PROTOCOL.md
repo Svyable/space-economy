@@ -15,9 +15,12 @@ The protocol is intentionally smaller than a marketplace. Discovery, auctions, c
 7. **Persistence is transactional from the kernel's point of view.** If persistence fails, in-memory mutation is rolled back. Stores receive the expected prior revision so production adapters can implement compare-and-swap semantics.
 8. **Commands are serialized per clearinghouse instance.** Once persistence is asynchronous, only one mutation may be in its commit phase at a time. Reads wait for already-enqueued commands so callers never observe state that has not successfully committed.
 9. **Cross-instance races converge through compare-and-swap.** A store revision conflict causes the losing instance to refresh from the winning snapshot before returning `STORE_CONFLICT`, allowing a meaningful retry.
-10. **Funded reservations are not silently cancelled.** Releasing funded capacity requires a refund/dispute rail; the v0.1 kernel refuses that transition rather than creating inconsistent financial state.
-11. **Proofs are recorded, not magically trusted.** Delivery proofs are hashed and marked `unverified` until a future service-specific verifier attests them.
-12. **Every successful mutation emits a tamper-evident event.** Events use a CloudEvents-compatible envelope and an RFC 8785-canonicalized SHA-256 hash chain.
+10. **Reservation expiry is seller-configured, not globally imposed.** An offer may define `reservationTtlSeconds`. If present, every new order receives an immutable `fundingDueAt`; if absent, the kernel does not invent a TTL.
+11. **Expired unpaid reservations release capacity atomically.** At or after `fundingDueAt`, funding is rejected and an authenticated caller may trigger `reserved -> expired`, restoring the reserved quantity in the same persisted mutation.
+12. **Service windows stop new reservations once they end.** Advance booking is allowed before and during a configured service window, but no new reservation may be created at or after `windowEnd`.
+13. **Funded reservations are not silently cancelled or expired.** Releasing funded capacity requires a refund/dispute rail; the kernel refuses those transitions rather than creating inconsistent financial state.
+14. **Proofs are recorded, not magically trusted.** Delivery proofs are hashed and marked `unverified` until a service-specific verifier attests them.
+15. **Every successful mutation emits a tamper-evident event.** Events use a CloudEvents-compatible envelope and an RFC 8785-canonicalized SHA-256 hash chain.
 
 ## Core objects
 
@@ -51,19 +54,32 @@ Publishes measurable capacity from one asset.
     "amount": "15",
     "scale": 2
   },
-  "capacity": 500000
+  "capacity": 500000,
+  "reservationTtlSeconds": 300
 }
 ```
 
 `service` and `unit` are extensible identifiers. Domain profiles may later define controlled vocabularies without changing the clearinghouse kernel.
 
+`reservationTtlSeconds` is optional. When null/omitted, unpaid reservations are not automatically bounded by a clearinghouse TTL. Sellers that need bounded holds can configure a positive duration per offer. The selected duration is copied into a concrete order deadline at reservation time so later offer-policy changes cannot retroactively change an existing buyer's funding deadline.
+
+`windowStart` / `windowEnd` describe the service availability window, not a global funding TTL. Advance reservation before `windowStart` is allowed. Once `windowEnd` has been reached, the offer cannot accept another reservation.
+
 ### Order
 
 Reserves quantity against exactly one offer.
 
-Lifecycle:
+Primary lifecycle:
 
 `reserved -> funded -> delivered -> settled`
+
+Unfunded terminal alternatives:
+
+`reserved -> cancelled`
+
+`reserved -> expired` (only when the offer created a `fundingDueAt` deadline and that deadline has been reached)
+
+At exactly `fundingDueAt`, the reservation is no longer fundable. Expiry may then be triggered by any authenticated actor because the condition is objective; authorization does not depend on the caller being buyer or seller. The transition records who triggered it for auditability and atomically returns capacity to the offer.
 
 `settled` in v0.1 means the clearinghouse has recorded a settlement reference approved by the buyer. It does **not** prove that this reference moved real funds unless the deployment's settlement adapter provides that guarantee.
 
@@ -103,6 +119,8 @@ Mutating requests should send:
 - `Idempotency-Key`: stable retry key for a logical command;
 - `If-Match`: optional numeric resource version for optimistic concurrency on existing resources.
 
+The expiry transition is exposed as `POST /v1/orders/{orderId}/expire`. Deployments may call it from an event-driven scheduler, durable workflow engine, or other authenticated process after the materialized funding deadline.
+
 The contract is defined in [`openapi.yaml`](../openapi.yaml).
 
 ## Storage port
@@ -120,7 +138,9 @@ The public clearinghouse API is therefore asynchronous. `Clearinghouse.open(opti
 
 Within one clearinghouse process, commands are queued in invocation order. A read waits for commands that were already enqueued when the read reached the kernel. If a save fails, the mutation is rolled back before queued reads proceed. If compare-and-swap fails because another process committed first, the instance reloads the winning snapshot before surfacing `STORE_CONFLICT`.
 
-Persisted state includes a `schemaVersion` and refuses unknown versions instead of guessing how to interpret future data.
+Persisted state uses schema version 2 for reservation-expiry fields. `Clearinghouse.open()` wraps the configured store in the migration layer: v1 snapshots receive `reservationTtlSeconds: null` on offers and `fundingDueAt: null` / `expiration: null` on orders in memory. Historical ledger events are not rewritten. The migrated v2 snapshot becomes durable only through the next successful normal CAS-backed mutation.
+
+See [`MIGRATIONS.md`](MIGRATIONS.md) for migration and rollback policy.
 
 ## Trust boundaries deliberately outside v0.1
 

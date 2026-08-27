@@ -17,7 +17,27 @@ Persisted clearinghouse state is a protocol surface. A deployment must not silen
 
 The last two rules are important operationally. A read-only startup or failed deployment must not unexpectedly rewrite the only durable copy of state.
 
-## Example
+## Clearinghouse schema versions
+
+### v1
+
+Initial snapshot schema containing assets, offers, orders, hash-chained ledger events, idempotency records, and the global store revision.
+
+### v2
+
+Adds bounded unpaid-reservation fields:
+
+- `offer.reservationTtlSeconds`, migrated to `null` for every v1 offer;
+- `order.fundingDueAt`, migrated to `null` for every v1 order;
+- `order.expiration`, migrated to `null` for every v1 order.
+
+The v1→v2 migration is deliberately additive. It does not infer a TTL for historical offers or reservations, because doing so would retroactively change economic terms. Existing unpaid reservations therefore remain unbounded unless they were created after a seller explicitly configured a TTL.
+
+Historical ledger events are left unchanged. Their canonical bytes and hashes remain valid.
+
+`Clearinghouse.open()` automatically wraps its configured store with the clearinghouse migration registry. A v1 snapshot is therefore presented to the kernel as v2 in memory, but the underlying durable copy remains v1 until a later successful domain mutation saves the current schema through normal compare-and-swap.
+
+## Generic example
 
 ```js
 import { JsonFileSnapshotStore } from '../src/store.js';
@@ -65,5 +85,7 @@ For a production database migration:
 3. validate application behavior before intentionally persisting the new schema;
 4. persist through the normal transactional/CAS path;
 5. keep a documented rollback point and understand whether old software can read the new schema.
+
+For v1→v2 specifically, old software cannot understand a persisted v2 snapshot because v1 correctly fails closed on unknown schema versions. A deployment that must support rollback should therefore keep a v1 backup/snapshot until the v2 rollout is accepted.
 
 Some future changes may require an offline data migration instead of lazy read migration. That should be an explicit operational tool using the same versioned transformation functions, not hidden behavior inside the clearinghouse kernel.
