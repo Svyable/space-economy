@@ -11,4 +11,7 @@ test('rejects values outside the supported I-JSON domain', () => {
   assert.throws(() => canonicalize({ bad: Number.NaN }), /finite/);
   assert.throws(() => canonicalize({ bad: undefined }), /undefined/);
   assert.throws(() => canonicalize('\uD800'), /well-formed Unicode/);
+  assert.throws(() => canonicalize('\uFDD0'), /noncharacters/);
+  assert.throws(() => canonicalize({ ['\uFFFF']: true }), /noncharacters/);
+  assert.throws(() => canonicalize(-0), /negative zero/);
 });

@@ -3,9 +3,9 @@ import test from 'node:test';
 import { Clearinghouse } from '../src/clearinghouse.js';
 import { createHttpServer } from '../src/server.js';
 
-async function withServer(run) {
+async function withServer(run, serverOptions = {}) {
   const market = new Clearinghouse();
-  const server = createHttpServer({ market });
+  const server = createHttpServer({ market, ...serverOptions });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
   const baseUrl = `http://127.0.0.1:${address.port}`;
@@ -51,6 +51,40 @@ test('HTTP idempotency retries return the same created asset', async () => {
     const secondBody = await second.json();
     assert.equal(firstBody.data.id, secondBody.data.id);
     assert.equal(market.listAssets().length, 1);
+  });
+});
+
+test('injected authenticator determines actor identity instead of caller headers', async () => {
+  const authenticate = async () => ({ actorId: 'verified-operator', assurance: { method: 'test' } });
+  await withServer(async ({ baseUrl, market }) => {
+    const response = await fetch(`${baseUrl}/v1/assets`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-participant-id': 'spoofed-operator',
+      },
+      body: JSON.stringify({ name: 'Relay A', type: 'satellite' }),
+    });
+    assert.equal(response.status, 201);
+    const body = await response.json();
+    assert.equal(body.data.ownerId, 'verified-operator');
+    assert.equal(market.listAssets()[0].ownerId, 'verified-operator');
+  }, { authenticate });
+});
+
+test('HTTP adapter rejects lookalike JSON media types', async () => {
+  await withServer(async ({ baseUrl }) => {
+    const response = await fetch(`${baseUrl}/v1/assets`, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json-patch+json',
+        'x-participant-id': 'relay-one',
+      },
+      body: JSON.stringify({ name: 'Relay A', type: 'satellite' }),
+    });
+    assert.equal(response.status, 415);
+    const body = await response.json();
+    assert.equal(body.code, 'UNSUPPORTED_MEDIA_TYPE');
   });
 });
 

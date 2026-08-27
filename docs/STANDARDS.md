@@ -6,7 +6,7 @@ The project should interoperate with existing standards instead of creating spac
 
 ### RFC 8785 — JSON Canonicalization Scheme
 
-Ledger events and delivery-proof digests need deterministic bytes before hashing or signing. The reference implementation canonicalizes its I-JSON domain objects before SHA-256 hashing.
+Ledger events and delivery-proof digests need deterministic bytes before hashing or signing. The reference implementation canonicalizes its I-JSON domain objects before SHA-256 hashing and rejects malformed Unicode, Unicode noncharacters, and negative zero rather than allowing ambiguous canonical inputs.
 
 Reference: <https://www.rfc-editor.org/rfc/rfc8785.html>
 
@@ -34,7 +34,21 @@ Fiat prices should use namespaced settlement asset identifiers such as `iso4217:
 
 Reference: <https://www.iso.org/standard/64758.html>
 
-## Integrate at domain boundaries
+## Integrate at protocol boundaries
+
+### RFC 9421 — HTTP Message Signatures
+
+Production HTTP deployments that use request signing should implement RFC 9421 rather than inventing a clearinghouse-specific signature header. The reference server exposes an injectable authenticator so signature verification, mTLS, OIDC, or gateway authentication can all derive the same trusted `actorId` without changing domain commands.
+
+A signed mutation profile should cover the request target, method, body integrity field, and concurrency/idempotency fields needed by the deployment. See [`AUTHENTICATION.md`](AUTHENTICATION.md).
+
+Reference: <https://www.rfc-editor.org/rfc/rfc9421.html>
+
+### RFC 9530 — Digest Fields
+
+Signed requests with content should use `Content-Digest` to bind the actual HTTP content bytes and cover that digest field with the message signature.
+
+Reference: <https://www.rfc-editor.org/rfc/rfc9530.html>
 
 ### CCSDS 502.0-B-3 — Orbit Data Messages
 

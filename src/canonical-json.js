@@ -1,5 +1,16 @@
 import { createHash } from 'node:crypto';
 
+function assertIJsonString(value, label = 'string') {
+  if (!value.isWellFormed()) throw new TypeError(`canonical JSON requires well-formed Unicode ${label}s`);
+  for (const character of value) {
+    const codePoint = character.codePointAt(0);
+    if ((codePoint >= 0xfdd0 && codePoint <= 0xfdef) || (codePoint & 0xffff) === 0xfffe || (codePoint & 0xffff) === 0xffff) {
+      throw new TypeError(`canonical JSON does not support Unicode noncharacters in ${label}s`);
+    }
+  }
+  return value;
+}
+
 function serialize(value, seen) {
   if (value === null) return 'null';
 
@@ -7,10 +18,10 @@ function serialize(value, seen) {
     case 'boolean':
       return value ? 'true' : 'false';
     case 'string':
-      if (!value.isWellFormed()) throw new TypeError('canonical JSON requires well-formed Unicode strings');
-      return JSON.stringify(value);
+      return JSON.stringify(assertIJsonString(value));
     case 'number':
       if (!Number.isFinite(value)) throw new TypeError('canonical JSON requires finite numbers');
+      if (Object.is(value, -0)) throw new TypeError('canonical JSON does not support negative zero');
       return JSON.stringify(value);
     case 'object': {
       if (seen.has(value)) throw new TypeError('canonical JSON does not support cyclic values');
@@ -22,9 +33,9 @@ function serialize(value, seen) {
           throw new TypeError('canonical JSON requires plain objects');
         }
         const fields = Object.keys(value)
+          .map((key) => assertIJsonString(key, 'property name'))
           .sort()
           .map((key) => {
-            if (!key.isWellFormed()) throw new TypeError('canonical JSON requires well-formed Unicode property names');
             if (value[key] === undefined) throw new TypeError('canonical JSON does not support undefined');
             return `${JSON.stringify(key)}:${serialize(value[key], seen)}`;
           });
