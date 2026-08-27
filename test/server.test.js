@@ -4,7 +4,7 @@ import { Clearinghouse } from '../src/clearinghouse.js';
 import { createHttpServer } from '../src/server.js';
 
 async function withServer(run, serverOptions = {}) {
-  const market = new Clearinghouse();
+  const market = await Clearinghouse.open();
   const server = createHttpServer({ market, ...serverOptions });
   await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
   const address = server.address();
@@ -50,7 +50,7 @@ test('HTTP idempotency retries return the same created asset', async () => {
     const firstBody = await first.json();
     const secondBody = await second.json();
     assert.equal(firstBody.data.id, secondBody.data.id);
-    assert.equal(market.listAssets().length, 1);
+    assert.equal((await market.listAssets()).length, 1);
   });
 });
 
@@ -68,7 +68,7 @@ test('injected authenticator determines actor identity instead of caller headers
     assert.equal(response.status, 201);
     const body = await response.json();
     assert.equal(body.data.ownerId, 'verified-operator');
-    assert.equal(market.listAssets()[0].ownerId, 'verified-operator');
+    assert.equal((await market.listAssets())[0].ownerId, 'verified-operator');
   }, { authenticate });
 });
 
