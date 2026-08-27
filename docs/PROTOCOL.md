@@ -13,9 +13,11 @@ The protocol is intentionally smaller than a marketplace. Discovery, auctions, c
 5. **Mutations are retry-safe.** An idempotency key can be persisted with a command result. Replaying the same command returns the original result; reusing a key with different input fails.
 6. **Mutable resources are versioned.** Offers and orders carry monotonically increasing `version` values for optimistic concurrency checks.
 7. **Persistence is transactional from the kernel's point of view.** If persistence fails, in-memory mutation is rolled back. Stores receive the expected prior revision so production adapters can implement compare-and-swap semantics.
-8. **Funded reservations are not silently cancelled.** Releasing funded capacity requires a refund/dispute rail; the v0.1 kernel refuses that transition rather than creating inconsistent financial state.
-9. **Proofs are recorded, not magically trusted.** Delivery proofs are hashed and marked `unverified` until a future service-specific verifier attests them.
-10. **Every successful mutation emits a tamper-evident event.** Events use a CloudEvents-compatible envelope and an RFC 8785-canonicalized SHA-256 hash chain.
+8. **Commands are serialized per clearinghouse instance.** Once persistence is asynchronous, only one mutation may be in its commit phase at a time. Reads wait for already-enqueued commands so callers never observe state that has not successfully committed.
+9. **Cross-instance races converge through compare-and-swap.** A store revision conflict causes the losing instance to refresh from the winning snapshot before returning `STORE_CONFLICT`, allowing a meaningful retry.
+10. **Funded reservations are not silently cancelled.** Releasing funded capacity requires a refund/dispute rail; the v0.1 kernel refuses that transition rather than creating inconsistent financial state.
+11. **Proofs are recorded, not magically trusted.** Delivery proofs are hashed and marked `unverified` until a future service-specific verifier attests them.
+12. **Every successful mutation emits a tamper-evident event.** Events use a CloudEvents-compatible envelope and an RFC 8785-canonicalized SHA-256 hash chain.
 
 ## Core objects
 
@@ -105,14 +107,18 @@ The contract is defined in [`openapi.yaml`](../openapi.yaml).
 
 ## Storage port
 
-The kernel accepts a snapshot store with two operations:
+The kernel accepts an asynchronous snapshot store with two operations:
 
 ```text
-load() -> snapshot | null
-save(snapshot, { expectedRevision })
+await load() -> snapshot | null
+await save(snapshot, { expectedRevision })
 ```
 
-`MemorySnapshotStore` and `JsonFileSnapshotStore` are reference adapters. The JSON adapter is single-writer local infrastructure; production deployments should use a transactional database adapter that enforces the expected revision atomically.
+`MemorySnapshotStore` and `JsonFileSnapshotStore` are reference adapters. The JSON adapter is single-writer local infrastructure; production deployments should use a transactional database adapter that enforces the expected revision atomically in the same transaction as the snapshot write.
+
+The public clearinghouse API is therefore asynchronous. `Clearinghouse.open(options)` eagerly loads and validates persisted state and is the preferred construction path for services. Commands and reads return promises even when backed by the in-memory adapter so switching to a networked database does not change the domain API.
+
+Within one clearinghouse process, commands are queued in invocation order. A read waits for commands that were already enqueued when the read reached the kernel. If a save fails, the mutation is rolled back before queued reads proceed. If compare-and-swap fails because another process committed first, the instance reloads the winning snapshot before surfacing `STORE_CONFLICT`.
 
 Persisted state includes a `schemaVersion` and refuses unknown versions instead of guessing how to interpret future data.
 

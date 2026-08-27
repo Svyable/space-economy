@@ -104,25 +104,26 @@ async function route(req, res, requestId, market, maxBodyBytes, authenticate) {
   const parts = url.pathname.split('/').filter(Boolean);
 
   if (req.method === 'GET' && url.pathname === '/health') {
-    return json(res, 200, { ok: true, ledgerValid: market.verifyLedger(), revision: market.getRevision() }, { 'x-request-id': requestId });
+    const [ledgerValid, revision] = await Promise.all([market.verifyLedger(), market.getRevision()]);
+    return json(res, 200, { ok: true, ledgerValid, revision }, { 'x-request-id': requestId });
   }
   if (req.method === 'GET' && url.pathname === '/v1/assets') {
-    return json(res, 200, { data: market.listAssets() }, { 'x-request-id': requestId });
+    return json(res, 200, { data: await market.listAssets() }, { 'x-request-id': requestId });
   }
   if (req.method === 'POST' && url.pathname === '/v1/assets') {
-    return json(res, 201, { data: market.registerAsset(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
+    return json(res, 201, { data: await market.registerAsset(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
   }
   if (req.method === 'GET' && url.pathname === '/v1/offers') {
-    return json(res, 200, { data: market.listOffers({ service: url.searchParams.get('service') ?? undefined, status: url.searchParams.get('status') ?? 'open' }) }, { 'x-request-id': requestId });
+    return json(res, 200, { data: await market.listOffers({ service: url.searchParams.get('service') ?? undefined, status: url.searchParams.get('status') ?? 'open' }) }, { 'x-request-id': requestId });
   }
   if (req.method === 'POST' && url.pathname === '/v1/offers') {
-    return json(res, 201, { data: market.createOffer(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
+    return json(res, 201, { data: await market.createOffer(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
   }
   if (req.method === 'POST' && url.pathname === '/v1/orders') {
-    return json(res, 201, { data: market.createOrder(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
+    return json(res, 201, { data: await market.createOrder(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
   }
   if (req.method === 'GET' && parts[0] === 'v1' && parts[1] === 'orders' && parts.length === 3) {
-    const order = market.getOrder(parts[2]);
+    const order = await market.getOrder(parts[2]);
     return json(res, 200, { data: order }, { etag: `"${order.version}"`, 'x-request-id': requestId });
   }
   if (req.method === 'POST' && parts[0] === 'v1' && parts[1] === 'orders' && parts.length === 4) {
@@ -130,13 +131,14 @@ async function route(req, res, requestId, market, maxBodyBytes, authenticate) {
     const action = parts[3];
     const body = action === 'cancel' ? {} : await readBody(req, maxBodyBytes);
     const commandContext = await requestContext(req, authenticate);
-    if (action === 'fund') return json(res, 200, { data: market.fundOrder(orderId, body, commandContext) }, { 'x-request-id': requestId });
-    if (action === 'deliver') return json(res, 200, { data: market.recordDelivery(orderId, body, commandContext) }, { 'x-request-id': requestId });
-    if (action === 'settle') return json(res, 200, { data: market.settleOrder(orderId, body, commandContext) }, { 'x-request-id': requestId });
-    if (action === 'cancel') return json(res, 200, { data: market.cancelOrder(orderId, commandContext) }, { 'x-request-id': requestId });
+    if (action === 'fund') return json(res, 200, { data: await market.fundOrder(orderId, body, commandContext) }, { 'x-request-id': requestId });
+    if (action === 'deliver') return json(res, 200, { data: await market.recordDelivery(orderId, body, commandContext) }, { 'x-request-id': requestId });
+    if (action === 'settle') return json(res, 200, { data: await market.settleOrder(orderId, body, commandContext) }, { 'x-request-id': requestId });
+    if (action === 'cancel') return json(res, 200, { data: await market.cancelOrder(orderId, commandContext) }, { 'x-request-id': requestId });
   }
   if (req.method === 'GET' && url.pathname === '/v1/ledger') {
-    return json(res, 200, { valid: market.verifyLedger(), data: market.getLedger() }, { 'x-request-id': requestId });
+    const [valid, data] = await Promise.all([market.verifyLedger(), market.getLedger()]);
+    return json(res, 200, { valid, data }, { 'x-request-id': requestId });
   }
 
   const error = new Error('route not found');
@@ -165,7 +167,7 @@ if (process.argv[1] && fileURLToPath(import.meta.url) === process.argv[1]) {
   const port = Number(process.env.PORT ?? 8787);
   const statePath = process.env.STATE_PATH ?? './data/state.json';
   const maxBodyBytes = Number(process.env.MAX_BODY_BYTES ?? 1_048_576);
-  const market = new Clearinghouse({ statePath });
+  const market = await Clearinghouse.open({ statePath });
   const server = createHttpServer({ market, maxBodyBytes });
   server.listen(port, () => {
     console.log(`Space Economy Clearinghouse listening on http://localhost:${port}`);
