@@ -1,0 +1,22 @@
+{
+  "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
+  "name": "io.github.Svyable/space-economy",
+  "title": "Space Economy Clearinghouse",
+  "description": "Read-first MCP tools for inspecting orbital capacity, space logistics assets and offers, clearinghouse orders, and ledger integrity, with optional Ed25519-signed policy-gated mutations.",
+  "repository": {
+    "url": "https://github.com/Svyable/space-economy",
+    "source": "github",
+    "subfolder": "adapters/mcp"
+  },
+  "version": "0.1.0",
+  "packages": [
+    {
+      "registryType": "npm",
+      "identifier": "@svyable/space-economy-mcp",
+      "version": "0.1.0",
+      "transport": {
+        "type": "stdio"
+      }
+    }
+  ]
+}

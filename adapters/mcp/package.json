@@ -1,0 +1,31 @@
+{
+  "name": "@svyable/space-economy-mcp",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "mcpName": "io.github.Svyable/space-economy",
+  "description": "Read-first Model Context Protocol adapter for the Space Economy clearinghouse.",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/Svyable/space-economy.git",
+    "directory": "adapters/mcp"
+  },
+  "bin": {
+    "space-economy-mcp": "./src/stdio.js"
+  },
+  "scripts": {
+    "start": "node src/stdio.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/client": "2.0.0"
+  },
+  "license": "MIT"
+}
