@@ -7,6 +7,8 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const skillPath = path.join(root, '.agents/skills/space-economy-clearinghouse/SKILL.md');
 const catalogPath = path.join(root, 'distribution/github-agentfinder/space-economy-clearinghouse.json');
+const mcpPackagePath = path.join(root, 'adapters/mcp/package.json');
+const mcpRegistryTemplatePath = path.join(root, 'distribution/mcp-registry/server.npm.template.json');
 
 function frontmatter(markdown) {
   const match = markdown.match(/^---\n([\s\S]*?)\n---\n/);
@@ -26,12 +28,14 @@ test('agent skill exposes stable discovery metadata', async () => {
   const description = fields.get('description');
   assert.ok(description);
   assert.ok(description.length <= 1024);
-  for (const keyword of ['space economy', 'orbital capacity', 'space logistics', 'settlement']) {
+  for (const keyword of ['space economy', 'orbital capacity', 'space logistics', 'settlement', 'mcp']) {
     assert.match(description.toLowerCase(), new RegExp(keyword.replace(' ', '\\s+')));
   }
   assert.match(markdown, /Capacity is conserved\./);
   assert.match(markdown, /Money is exact and decimal-safe\./);
   assert.match(markdown, /Unpaid reservation expiry requires an explicit due deadline/);
+  assert.match(markdown, /adapters\/mcp\/src\/server\.js/);
+  assert.match(markdown, /MCP is a transport boundary, not an authorization shortcut\./);
 });
 
 test('GitHub Agent Finder entry points at the published skill on main', async () => {
@@ -41,8 +45,22 @@ test('GitHub Agent Finder entry points at the published skill on main', async ()
   assert.equal(entry.url, 'https://github.com/Svyable/space-economy/blob/main/.agents/skills/space-economy-clearinghouse/SKILL.md');
   assert.equal(entry.metadata.sourceSet, 'space-economy');
   assert.equal(entry.metadata.repoPath, '.agents/skills/space-economy-clearinghouse/SKILL.md');
-  assert.ok(entry.tags.includes('space-economy'));
-  assert.ok(entry.tags.includes('space-logistics'));
+  for (const tag of ['space-economy', 'space-logistics', 'mcp', 'model-context-protocol']) {
+    assert.ok(entry.tags.includes(tag), `missing Agent Finder tag: ${tag}`);
+  }
+  assert.match(entry.description.toLowerCase(), /mcp/);
+});
+
+test('MCP Registry template matches adapter package identity but package remains publication-locked', async () => {
+  const pkg = JSON.parse(await fs.readFile(mcpPackagePath, 'utf8'));
+  const registry = JSON.parse(await fs.readFile(mcpRegistryTemplatePath, 'utf8'));
+  assert.equal(pkg.private, true, 'adapter must remain protected from accidental npm publication');
+  assert.equal(pkg.mcpName, registry.name);
+  assert.equal(pkg.name, registry.packages[0].identifier);
+  assert.equal(pkg.version, registry.version);
+  assert.equal(pkg.version, registry.packages[0].version);
+  assert.equal(registry.packages[0].transport.type, 'stdio');
+  assert.equal(pkg.bin['space-economy-mcp'], './src/stdio.js');
 });
 
 test('coding-agent instructions preserve core economic and trust boundaries', async () => {

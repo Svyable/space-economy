@@ -4,15 +4,17 @@ Open infrastructure for coordinating **assets, scarce physical capacity, deliver
 
 The thesis: launch, communications, sensing, power, docking, logistics, compute, manufacturing, and surface operations should not each reinvent bilateral booking and settlement. They need a small common transaction kernel that can sit underneath many market designs.
 
-This repository is a zero-runtime-dependency Node.js reference implementation of that kernel.
+This repository is a zero-runtime-dependency Node.js reference implementation of that kernel, with optional adapters such as PostgreSQL and MCP kept behind explicit dependency boundaries.
 
 ## For agents
 
 If you are an AI coding or research agent, start with [`AGENTS.md`](AGENTS.md). It maps the architecture, invariants, tests, and trust boundaries.
 
-If you are looking for reusable expertise for a task involving **space-economy infrastructure, orbital capacity markets, space logistics, asset registries, booking/reservations, delivery proofs, settlement coordination, or autonomous market agents**, use the Agent Skill at [`.agents/skills/space-economy-clearinghouse/SKILL.md`](.agents/skills/space-economy-clearinghouse/SKILL.md).
+If you are looking for reusable expertise for a task involving **space-economy infrastructure, orbital capacity markets, space logistics, asset registries, booking/reservations, delivery proofs, settlement coordination, MCP tools, or autonomous market agents**, use the Agent Skill at [`.agents/skills/space-economy-clearinghouse/SKILL.md`](.agents/skills/space-economy-clearinghouse/SKILL.md).
 
-The repository also contains a ready-to-submit GitHub Agent Finder catalog entry at [`distribution/github-agentfinder/space-economy-clearinghouse.json`](distribution/github-agentfinder/space-economy-clearinghouse.json). See [`docs/AGENT_DISCOVERY.md`](docs/AGENT_DISCOVERY.md) for the Agent Skills, ARD, A2A, MCP, and registry strategy.
+For a callable agent interface, see the read-first MCP v2 adapter in [`adapters/mcp/`](adapters/mcp/). Its default tools only inspect market state. A mutation tool exists only when a deployment injects the verified `SignedCommandExecutor`, so raw MCP arguments never become trusted participant identity.
+
+The repository also contains a ready-to-submit GitHub Agent Finder catalog entry at [`distribution/github-agentfinder/space-economy-clearinghouse.json`](distribution/github-agentfinder/space-economy-clearinghouse.json). See [`docs/AGENT_DISCOVERY.md`](docs/AGENT_DISCOVERY.md) for the Agent Skills, MCP Registry, ARD, A2A, and discovery strategy.
 
 ## What the kernel does
 
@@ -28,7 +30,7 @@ The repository also contains a ready-to-submit GitHub Agent Finder catalog entry
 - Refuses financially unsafe transitions such as silently cancelling or expiring funded capacity.
 - Emits CloudEvents-compatible, RFC 8785-canonicalized SHA-256 ledger events.
 - Persists schema-versioned snapshots behind an asynchronous replaceable storage port.
-- Provides a transactionally CAS-protected PostgreSQL snapshot adapter without making a database driver a runtime dependency.
+- Provides a transactionally CAS-protected PostgreSQL snapshot adapter without making a database driver a core runtime dependency.
 - Migrates historical persisted snapshots explicitly without rewriting ledger history.
 - Serializes local mutations and uses revision compare-and-swap for cross-instance races.
 - Provides typed, attributable delivery-proof verifier profiles.
@@ -44,6 +46,8 @@ The repository also contains a ready-to-submit GitHub Agent Finder catalog entry
 The reference HTTP server does **not** provide production participant authentication, custody funds, independently verify arbitrary telemetry, prove spacecraft ownership, run conjunction assessment, perform KYC/KYB, or satisfy export-control/licensing requirements. Those are explicit adapter and policy boundaries, not hidden TODOs.
 
 The signed-command and credential modules provide verification **contracts and primitives**. Deployments still own trusted key resolution, key custody/rotation, credential trust anchors, revocation policy, replay storage, and actual organizational authorization.
+
+The MCP adapter is callable locally/programmatically, but the repository does **not** claim a hosted production MCP endpoint or public registry package exists yet. Remote exposure requires a real security perimeter and durable deployment.
 
 Read [`SECURITY.md`](SECURITY.md) before deploying anything beyond local development.
 
@@ -145,7 +149,42 @@ const market = await Clearinghouse.open({ store });
 
 The adapter uses a PostgreSQL transaction, a per-store advisory lock, row locking, and expected-revision comparison so two application instances cannot both commit from the same revision. See [`docs/POSTGRES.md`](docs/POSTGRES.md) for deployment, DDL, failure, and operational guidance.
 
-## API
+## MCP agent runtime
+
+MCP dependencies live only under [`adapters/mcp/`](adapters/mcp/). The adapter targets the stable MCP TypeScript SDK v2 line and supports modern Streamable HTTP plus local stdio.
+
+Default tools:
+
+```text
+list_assets
+list_offers
+get_order
+get_market_status
+```
+
+Default resource:
+
+```text
+space-economy://protocol/overview
+```
+
+Run the local read-only stdio server:
+
+```bash
+cd adapters/mcp
+npm install
+STATE_PATH=../../data/state.json npm start
+```
+
+A programmatic deployment can use `createSpaceEconomyMcpHandler({ market })` for Streamable HTTP. If—and only if—a deployment supplies a configured `SignedCommandExecutor`, the handler also exposes:
+
+```text
+execute_signed_command
+```
+
+That tool transports a complete Ed25519 `spaceeconomy.command.v1` envelope through signature/key authorization, policy gates, the explicit command allowlist, and the clearinghouse's transactional/idempotent mutation path. See [`adapters/mcp/README.md`](adapters/mcp/README.md).
+
+## HTTP API
 
 ```text
 GET  /health
@@ -203,7 +242,7 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
 ## Architecture
 
 ```text
- authenticated HTTP / signed commands / agent adapters
+ authenticated HTTP / signed commands / MCP and agent adapters
                     |
                     v
           identity + credential verification
@@ -224,7 +263,7 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
 
 External orchestration/adapters:
 payments • proof evidence • compliance services • conjunction safety
-refunds/disputes • insurance • auctions/RFQs • agent/MCP/A2A surfaces
+refunds/disputes • insurance • auctions/RFQs • A2A/higher-level agents
 ```
 
 The core storage contract is deliberately tiny: `await load()` and `await save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer. `PostgresSnapshotStore` moves the same contract into a real transaction with cross-process locking and revision CAS. A lost race refreshes the clearinghouse instance from the winning snapshot before returning `STORE_CONFLICT`, so an application can retry against current state.
@@ -245,8 +284,10 @@ The project uses or targets existing interoperability standards rather than repl
 - ISO 4217 namespacing for fiat settlement assets;
 - CCSDS Orbit Data Messages and Conjunction Data Messages at space-data boundaries;
 - W3C DID / Verifiable Credentials as optional identity and credential adapters;
+- Model Context Protocol 2026-07-28 through the isolated MCP v2 adapter;
 - Agent Skills and `AGENTS.md` for portable agent-facing repository expertise;
-- Agentic Resource Discovery (ARD) as the planned web-scale discovery layer once a publisher-controlled domain is available.
+- the Official MCP Registry as the future package/remote installation discovery surface;
+- Agentic Resource Discovery (ARD) as the planned publisher-domain discovery layer.
 
 See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs/AUTHENTICATION.md`](docs/AUTHENTICATION.md) for the production identity boundary, [`docs/PROTOCOL.md`](docs/PROTOCOL.md) for invariants and trust boundaries, and [`docs/AGENT_DISCOVERY.md`](docs/AGENT_DISCOVERY.md) for agent discoverability.
 
@@ -257,9 +298,10 @@ See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs
 3. Durable reservation-expiry scheduling above the objective kernel transition.
 4. RFQ/auction matching above the clearing kernel.
 5. Concrete CCSDS-backed orbit/conjunction policy gates.
-6. Hosted ARD publication plus a read-first MCP/A2A agent surface where actual runtime use cases justify it.
-7. Event/read-model projections for discovery, analytics, and high-volume queries.
-8. External ledger anchoring and portable transaction receipts.
-9. Backup/restore drills, observability, and database deployment hardening for production operators.
+6. Package or securely host the MCP adapter and publish validated metadata through the Official MCP Registry.
+7. Publish ARD from a publisher-controlled HTTPS domain; add A2A only when an actual higher-level agent runtime exists.
+8. Event/read-model projections for discovery, analytics, and high-volume queries.
+9. External ledger anchoring and portable transaction receipts.
+10. Backup/restore drills, observability, and database deployment hardening for production operators.
 
 The long-term goal is not one marketplace. It is a transaction substrate that many independent space businesses and autonomous agents can compose around.

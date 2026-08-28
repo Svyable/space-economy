@@ -1,8 +1,8 @@
 ---
 name: space-economy-clearinghouse
-description: Design, evaluate, or integrate open transaction infrastructure for the space economy: orbital capacity markets, spacecraft and ground asset registries, space logistics and launch booking, communications or observation capacity, exact pricing, reservation/idempotency semantics, delivery-proof verification, settlement coordination, and policy boundaries. Use when building agentic or software systems that need interoperable market primitives for scarce physical space capabilities rather than a single marketplace UI.
+description: Design, evaluate, or integrate open transaction infrastructure for the space economy: orbital capacity markets, spacecraft and ground asset registries, space logistics and launch booking, communications or observation capacity, exact pricing, reservation/idempotency semantics, delivery-proof verification, settlement coordination, policy boundaries, and the read-first MCP v2 agent runtime. Use when building agentic or software systems that need interoperable market primitives for scarce physical space capabilities rather than a single marketplace UI.
 license: MIT
-compatibility: Requires access to this repository or its public documentation. Reference implementation targets Node.js 22 or 24 LTS.
+compatibility: Requires access to this repository or its public documentation. Reference implementation and MCP adapter target Node.js 22 or 24 LTS.
 metadata:
   author: Svyable
   repository: https://github.com/Svyable/space-economy
@@ -27,16 +27,46 @@ The task involves one or more of these ideas:
 - exact monetary amounts and provider-neutral settlement references;
 - telemetry receipts, delivery evidence, verifier profiles, or automated settlement gates;
 - licensing, insurance, export/compliance, mission-safety, or conjunction policy as external gates;
-- designing an MCP tool, A2A agent, API, marketplace, exchange, or autonomous agent that needs a trustworthy economic transaction layer underneath it.
+- connecting an MCP host or autonomous agent to a read-first clearinghouse interface;
+- designing an A2A agent, API, marketplace, exchange, or autonomous agent that needs a trustworthy economic transaction layer underneath it.
+
+## Callable agent surface
+
+The repository includes a Model Context Protocol v2 adapter at:
+
+```text
+adapters/mcp/
+```
+
+Its default surface is read-only:
+
+```text
+list_assets
+list_offers
+get_order
+get_market_status
+space-economy://protocol/overview
+```
+
+A deployment may inject `SignedCommandExecutor` to add one mutation surface:
+
+```text
+execute_signed_command
+```
+
+That tool accepts a complete Ed25519 `spaceeconomy.command.v1` envelope. Do not replace it with tools that accept caller-supplied `actorId` for raw mutations.
+
+The repository provides local read-only stdio and a programmatic Streamable HTTP handler. It does **not** claim that a public hosted MCP endpoint, production authentication perimeter, or official MCP Registry package is already deployed.
 
 ## Do not use this skill as a claim that
 
-- the reference server authenticates real participants;
+- the reference HTTP or MCP server authenticates real participants by itself;
 - the project provides custody, escrow, banking, or payment licensing;
 - a catalog identifier proves spacecraft ownership/control;
 - arbitrary telemetry is already trusted or independently verified;
 - regulatory, export-control, licensing, sanctions, insurance, or conjunction policy is automatically satisfied;
-- the hash-chained ledger is a blockchain or decentralized consensus system.
+- the hash-chained ledger is a blockchain or decentralized consensus system;
+- the existence of an MCP handler means a remotely hosted production service already exists.
 
 Those are explicit trust and adapter boundaries.
 
@@ -77,6 +107,7 @@ When designing a new capability:
 9. **Keep external settlement external.** Payment rails produce attributable receipts; reconcile external effects with clearinghouse state as a saga rather than pretending cross-system ACID.
 10. **Run policy before mutation.** Licensing, insurance, mission, export/compliance, and safety checks belong in explicit gates.
 11. **Emit portable audit events.** Preserve immutable historical event bytes; version future formats instead of rewriting history.
+12. **Keep agent writes signed.** A transport such as MCP may carry intent, but authenticated actor identity and command authorization must come from verified signed context.
 
 ## Repository entry points
 
@@ -89,7 +120,12 @@ Read only what the task requires:
 - `docs/SETTLEMENT.md` — external money-rail contract.
 - `docs/POLICY_GATES.md` — pre-command policy boundary.
 - `docs/MIGRATIONS.md` — durable schema evolution.
-- `docs/AUTHENTICATION.md` — production authentication profile.
+- `docs/POSTGRES.md` — transactional production persistence adapter.
+- `docs/AUTHENTICATION.md` — production HTTP authentication profile.
+- `docs/SIGNED_COMMANDS.md` — transport-neutral Ed25519 intent.
+- `docs/COMMAND_EXECUTION.md` — signature → policy → explicit dispatch pipeline.
+- `docs/CREDENTIALS.md` — portable authority credential verification.
+- `adapters/mcp/README.md` — MCP v2 tool surface and deployment boundary.
 - `openapi.yaml` — versioned HTTP contract.
 - `SECURITY.md` — production caveats.
 
@@ -97,30 +133,38 @@ Core implementation:
 
 - `src/clearinghouse.js`
 - `src/store.js`
+- `src/postgres-store.js`
 - `src/migrations.js`
 - `src/schema.js`
 - `src/proofs.js`
 - `src/settlement.js`
 - `src/policy.js`
+- `src/credentials.js`
+- `src/signed-command.js`
+- `src/command-executor.js`
+- `adapters/mcp/src/server.js`
 
 ## Integration guidance
 
-### Building an agent or MCP tool
+### Connecting an MCP host
 
-Expose narrow operations that map to explicit clearinghouse commands. Do not allow a caller-provided string to select arbitrary JavaScript methods.
+Prefer the existing `adapters/mcp` server rather than inventing a parallel tool contract.
 
-Good tool boundaries include:
+For inspection, use the read-only tools directly. For mutations, inject a properly configured `SignedCommandExecutor` and send a signed command envelope through `execute_signed_command`.
 
-- register/list assets;
-- publish/list offers;
-- reserve capacity;
-- fund with an already-created external rail reference;
-- record delivery evidence;
-- settle with an attributable external reference;
-- expire an objectively due unpaid reservation;
-- inspect ledger/integrity state.
+Do not expose reflective access such as `market[toolName](...)`, and do not let a model choose an arbitrary participant identity in tool arguments.
 
-Authenticate the agent/user before deriving `actorId`. Put compliance or authority claims into policy context rather than into mutable order payloads.
+A public Streamable HTTP deployment must add TLS, Host/Origin validation, authentication/authorization, limits, abuse controls, observability, and durable production storage around the MCP handler.
+
+### Building another agent or protocol adapter
+
+Expose narrow operations that map to explicit clearinghouse commands. Preserve the same ordering used by the signed executor:
+
+```text
+verify identity/signature -> policy -> explicit operation -> transactional kernel
+```
+
+Good boundaries include read-only market inspection and transport of already-signed economic intent. Do not weaken the identity boundary merely because a new agent protocol has its own session or token mechanism.
 
 ### Building a marketplace or exchange
 
@@ -139,13 +183,14 @@ Define a versioned proof profile. Return attributable `verified`, `rejected`, or
 - Capacity is conserved.
 - Quantities are positive integers.
 - Money is exact and decimal-safe.
-- Actor identity comes from trusted context, not request bodies.
+- Actor identity comes from trusted context, not request bodies or MCP tool arguments.
 - Idempotency keys cannot be reused with different command input.
 - Persistence failures roll back in-memory state.
 - Cross-instance writes use revision compare-and-swap.
 - Unpaid reservation expiry requires an explicit due deadline and restores capacity atomically.
 - Funded reservations are not silently cancelled or expired without a refund/dispute workflow.
 - Historical hash-chained events are not mutated by ordinary migrations.
+- MCP is a transport boundary, not an authorization shortcut.
 
 ## Output expectations for architecture work
 
@@ -158,6 +203,7 @@ When proposing an extension, make the answer explicit about:
 - trust assumptions;
 - standards reused;
 - migration/compatibility impact;
+- agent/protocol exposure impact;
 - tests needed to prove conservation and failure behavior.
 
 Prefer the smallest primitive that can support many future businesses over a vertically specific feature.
