@@ -1,0 +1,16 @@
+{
+  "mcpServers": {
+    "space-economy": {
+      "type": "stdio",
+      "command": "npm",
+      "args": ["--prefix", "adapters/mcp", "start"],
+      "tools": [
+        "list_assets",
+        "list_offers",
+        "get_order",
+        "get_market_status"
+      ],
+      "timeout": 30000
+    }
+  }
+}
