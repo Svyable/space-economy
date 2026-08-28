@@ -28,10 +28,14 @@
     ".": "./src/clearinghouse.js",
     "./canonical-json": "./src/canonical-json.js",
     "./store": "./src/store.js",
+    "./postgres-store": "./src/postgres-store.js",
     "./migrations": "./src/migrations.js",
     "./policy": "./src/policy.js",
     "./proofs": "./src/proofs.js",
-    "./settlement": "./src/settlement.js"
+    "./settlement": "./src/settlement.js",
+    "./credentials": "./src/credentials.js",
+    "./signed-command": "./src/signed-command.js",
+    "./command-executor": "./src/command-executor.js"
   },
   "scripts": {
     "start": "node src/server.js",

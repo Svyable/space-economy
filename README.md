@@ -28,16 +28,22 @@ The repository also contains a ready-to-submit GitHub Agent Finder catalog entry
 - Refuses financially unsafe transitions such as silently cancelling or expiring funded capacity.
 - Emits CloudEvents-compatible, RFC 8785-canonicalized SHA-256 ledger events.
 - Persists schema-versioned snapshots behind an asynchronous replaceable storage port.
+- Provides a transactionally CAS-protected PostgreSQL snapshot adapter without making a database driver a runtime dependency.
 - Migrates historical persisted snapshots explicitly without rewriting ledger history.
 - Serializes local mutations and uses revision compare-and-swap for cross-instance races.
 - Provides typed, attributable delivery-proof verifier profiles.
 - Provides provider-neutral external settlement adapter contracts.
+- Provides portable credential-verifier profiles for licensing, asset control, insurance, and other authority claims.
 - Provides attributable pre-command policy gates for deployment rules.
+- Signs and verifies transport-neutral Ed25519 command envelopes for queues, relays, and intermittent links.
+- Provides an explicit signed-command executor that verifies identity, runs policy, and dispatches only whitelisted economic operations.
 - Exposes a versioned HTTP API with RFC 9457 errors and an OpenAPI 3.2 contract.
 
 ## What it deliberately does not pretend to do
 
-The reference server does **not** authenticate participants, custody funds, independently verify arbitrary telemetry, prove spacecraft ownership, run conjunction assessment, perform KYC/KYB, or satisfy export-control/licensing requirements. Those are explicit adapter and policy boundaries, not hidden TODOs.
+The reference HTTP server does **not** provide production participant authentication, custody funds, independently verify arbitrary telemetry, prove spacecraft ownership, run conjunction assessment, perform KYC/KYB, or satisfy export-control/licensing requirements. Those are explicit adapter and policy boundaries, not hidden TODOs.
+
+The signed-command and credential modules provide verification **contracts and primitives**. Deployments still own trusted key resolution, key custody/rotation, credential trust anchors, revocation policy, replay storage, and actual organizational authorization.
 
 Read [`SECURITY.md`](SECURITY.md) before deploying anything beyond local development.
 
@@ -110,11 +116,34 @@ Supported package entry points include:
 space-economy-clearinghouse
 space-economy-clearinghouse/canonical-json
 space-economy-clearinghouse/store
+space-economy-clearinghouse/postgres-store
 space-economy-clearinghouse/migrations
 space-economy-clearinghouse/policy
 space-economy-clearinghouse/proofs
 space-economy-clearinghouse/settlement
+space-economy-clearinghouse/credentials
+space-economy-clearinghouse/signed-command
+space-economy-clearinghouse/command-executor
 ```
+
+### PostgreSQL persistence
+
+`PostgresSnapshotStore` accepts a standard pool interface instead of importing a database driver itself:
+
+```js
+import pg from 'pg';
+import { Clearinghouse } from './src/clearinghouse.js';
+import { PostgresSnapshotStore } from './src/postgres-store.js';
+
+const { Pool } = pg;
+const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const store = new PostgresSnapshotStore(pool, { storeKey: 'production-market' });
+await store.ensureSchema();
+
+const market = await Clearinghouse.open({ store });
+```
+
+The adapter uses a PostgreSQL transaction, a per-store advisory lock, row locking, and expected-revision comparison so two application instances cannot both commit from the same revision. See [`docs/POSTGRES.md`](docs/POSTGRES.md) for deployment, DDL, failure, and operational guidance.
 
 ## API
 
@@ -174,10 +203,13 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
 ## Architecture
 
 ```text
- authenticated transports / market applications
+ authenticated HTTP / signed commands / agent adapters
                     |
                     v
-              versioned API
+          identity + credential verification
+                    |
+                    v
+                policy gates
                     |
                     v
           clearinghouse domain kernel
@@ -187,17 +219,19 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
         CloudEvents-compatible event ledger
                     |
       migration-aware async store port
-              /             \
-       memory/dev JSON    production DB
+          /         |          \
+      memory      local JSON   PostgreSQL
 
-External policy/adapters:
-identity • credentials • payments • proof verification • compliance
-conjunction safety • disputes • insurance • auctions/RFQs
+External orchestration/adapters:
+payments • proof evidence • compliance services • conjunction safety
+refunds/disputes • insurance • auctions/RFQs • agent/MCP/A2A surfaces
 ```
 
-The core storage contract is deliberately tiny: `await load()` and `await save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer; a production database adapter should enforce compare-and-swap transactionally. A lost cross-process race refreshes the in-memory instance from the winning snapshot before returning `STORE_CONFLICT`, so an application can retry against current state.
+The core storage contract is deliberately tiny: `await load()` and `await save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer. `PostgresSnapshotStore` moves the same contract into a real transaction with cross-process locking and revision CAS. A lost race refreshes the clearinghouse instance from the winning snapshot before returning `STORE_CONFLICT`, so an application can retry against current state.
 
 Persisted schema v2 adds reservation-expiry fields through an explicit v1→v2 migration. Loading old state does not rewrite it; the migrated snapshot becomes durable only through a later successful normal mutation. See [`docs/MIGRATIONS.md`](docs/MIGRATIONS.md).
+
+For asynchronous or cross-network execution, [`docs/SIGNED_COMMANDS.md`](docs/SIGNED_COMMANDS.md) defines the signed intent envelope and [`docs/COMMAND_EXECUTION.md`](docs/COMMAND_EXECUTION.md) defines the secure verification → policy → whitelisted-dispatch pipeline. [`docs/CREDENTIALS.md`](docs/CREDENTIALS.md) defines portable authority verification without forcing one credential technology into the kernel.
 
 ## Standards strategy
 
@@ -218,14 +252,14 @@ See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs
 
 ## Near-term roadmap
 
-1. Production PostgreSQL adapter implementing atomic revision compare-and-swap on the async store port.
-2. Signed command envelopes and a verified-command execution pipeline for asynchronous/intermittent links.
-3. Portable participant, licensing, asset-control, and insurance credential adapters.
-4. Durable reservation-expiry scheduling/reconciliation above the objective kernel transition.
-5. Durable settlement/proof orchestration and reconciliation workflows.
-6. RFQ/auction matching above the clearing kernel.
-7. CCSDS-backed orbit/conjunction policy gate implementations.
-8. Hosted ARD publication plus MCP/A2A adapters where actual runtime use cases justify them.
-9. External ledger anchoring and receipt export.
+1. Production key-resolution/authentication adapters and operational key rotation/revocation profiles.
+2. Durable settlement/proof orchestration and reconciliation workflows.
+3. Durable reservation-expiry scheduling above the objective kernel transition.
+4. RFQ/auction matching above the clearing kernel.
+5. Concrete CCSDS-backed orbit/conjunction policy gates.
+6. Hosted ARD publication plus a read-first MCP/A2A agent surface where actual runtime use cases justify it.
+7. Event/read-model projections for discovery, analytics, and high-volume queries.
+8. External ledger anchoring and portable transaction receipts.
+9. Backup/restore drills, observability, and database deployment hardening for production operators.
 
 The long-term goal is not one marketplace. It is a transaction substrate that many independent space businesses and autonomous agents can compose around.
