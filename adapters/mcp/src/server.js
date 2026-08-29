@@ -35,7 +35,7 @@ Non-negotiable invariants:
 - historical hash-chained ledger events are not rewritten by ordinary migrations;
 - external payment, credential, proof, compliance, and mission-safety systems remain explicit trust boundaries.
 
-For market discovery, prefer find_capacity over unbounded offer listing. Capacity pagination is pinned to a clearinghouse revision and filter hash; if the market changes between pages the cursor fails explicitly and the caller restarts the query.
+For market discovery, prefer find_capacity over unbounded offer listing. Capacity pagination is pinned to a clearinghouse revision and filter hash. Deployments may serve that contract from the live market or an injected indexed projection; a cursor remains valid only while the selected read source can serve its pinned revision.
 
 The MCP adapter is read-only unless a SignedCommandExecutor is explicitly injected. When enabled, the only mutation tool accepts a fully signed spaceeconomy.command.v1 envelope and routes it through signature/key verification, policy gates, and the executor's closed operation map.
 `;
@@ -106,6 +106,13 @@ function assertCommandExecutor(commandExecutor) {
   }
 }
 
+function assertCapacitySource(capacitySource) {
+  if (capacitySource === null) return;
+  if (!capacitySource || typeof capacitySource.search !== 'function') {
+    throw new TypeError('capacitySource must provide search()');
+  }
+}
+
 function result(data) {
   return {
     content: [{ type: 'text', text: JSON.stringify(data, null, 2) }],
@@ -140,15 +147,19 @@ function guarded(handler) {
 
 export function createSpaceEconomyMcpServer({
   market,
+  capacitySource = null,
   commandExecutor = null,
   name = 'space-economy-clearinghouse',
   version = '0.1.0',
 } = {}) {
   assertMarket(market);
+  assertCapacitySource(capacitySource);
   assertCommandExecutor(commandExecutor);
 
   const server = new McpServer({ name, version });
-  const capacityDirectory = new CapacityDirectory({ market });
+  const capacityDirectory = capacitySource === null
+    ? new CapacityDirectory({ market })
+    : new CapacityDirectory({ source: capacitySource });
 
   server.registerResource(
     'space-economy-protocol',
@@ -191,7 +202,7 @@ export function createSpaceEconomyMcpServer({
     'find_capacity',
     {
       title: 'Find Space Economy Capacity',
-      description: 'Search scarce physical capacity with bounded deterministic pagination. Filters can constrain service, unit, settlement asset, seller, asset type/capabilities, remaining quantity, availability time, and status. Cursors are pinned to one clearinghouse revision and filter set, so market changes fail explicitly instead of shifting pages silently.',
+      description: 'Search scarce physical capacity with bounded deterministic pagination. Filters can constrain service, unit, settlement asset, seller, asset type/capabilities, remaining quantity, availability time, and status. Cursors are pinned to one clearinghouse revision and filter set; the selected read source determines which pinned revisions it can continue serving.',
       inputSchema: FindCapacityInput,
       annotations: READ_ONLY,
     },
