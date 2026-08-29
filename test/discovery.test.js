@@ -113,6 +113,10 @@ test('supported package subpath exports are importable without deep src imports'
     'space-economy-clearinghouse/reservation-expiry',
     'space-economy-clearinghouse/postgres-reservation-expiry',
     'space-economy-clearinghouse/rfq-market',
+    'space-economy-clearinghouse/mission-bundle',
+    'space-economy-clearinghouse/provider-history',
+    'space-economy-clearinghouse/market-price-history',
+    'space-economy-clearinghouse/procurement-evaluation',
     'space-economy-clearinghouse/rfq-opportunities',
   ]) {
     const module = await import(specifier);
