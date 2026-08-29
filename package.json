@@ -37,6 +37,7 @@
     "./signed-command": "./src/signed-command.js",
     "./command-executor": "./src/command-executor.js",
     "./capacity-query": "./src/capacity-query.js",
+    "./postgres-capacity-projection": "./src/postgres-capacity-projection.js",
     "./reservation-expiry": "./src/reservation-expiry.js"
   },
   "scripts": {

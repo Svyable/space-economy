@@ -98,6 +98,9 @@ const statusByCode = {
   STALE_VERSION: 412,
   STALE_CURSOR: 409,
   READ_SNAPSHOT_CONFLICT: 409,
+  PROJECTION_EMPTY: 503,
+  PROJECTION_REGRESSION: 409,
+  CORRUPT_PROJECTION: 500,
   STORE_CONFLICT: 409,
   UNSUPPORTED_MEDIA_TYPE: 415,
   PAYLOAD_TOO_LARGE: 413,
@@ -175,12 +178,15 @@ async function route(req, res, requestId, market, capacityDirectory, maxBodyByte
 
 export function createHttpServer({
   market = new Clearinghouse(),
+  capacitySource = null,
   maxBodyBytes = 1_048_576,
   authenticate = developmentHeaderAuthenticator,
 } = {}) {
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) throw new TypeError('maxBodyBytes must be a positive safe integer');
   if (typeof authenticate !== 'function') throw new TypeError('authenticate must be a function');
-  const capacityDirectory = new CapacityDirectory({ market });
+  const capacityDirectory = capacitySource === null
+    ? new CapacityDirectory({ market })
+    : new CapacityDirectory({ source: capacitySource });
   return http.createServer(async (req, res) => {
     const requestId = req.headers['x-request-id'] || randomUUID();
     try {
