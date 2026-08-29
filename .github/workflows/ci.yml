@@ -45,7 +45,7 @@ jobs:
         with:
           node-version: 24
       - run: npm install --no-save --ignore-scripts pg@8.23.0
-      - run: node --test integration/postgres-store.integration.mjs
+      - run: node --test integration/*.integration.mjs
         env:
           DATABASE_URL: postgresql://postgres:postgres@127.0.0.1:5432/space_economy_test
 
