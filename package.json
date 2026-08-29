@@ -36,6 +36,7 @@
     "./credentials": "./src/credentials.js",
     "./signed-command": "./src/signed-command.js",
     "./command-executor": "./src/command-executor.js",
+    "./capacity-query": "./src/capacity-query.js",
     "./reservation-expiry": "./src/reservation-expiry.js"
   },
   "scripts": {
