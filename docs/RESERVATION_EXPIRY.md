@@ -98,6 +98,25 @@ It:
 
 This is intentionally simple and rebuildable. It proves the worker contract but is not the production scaling target because scanning the entire ledger is O(history).
 
+## PostgreSQL candidate source
+
+For deployments already using `PostgresSnapshotStore`, the package also provides:
+
+```text
+space-economy-clearinghouse/postgres-reservation-expiry
+```
+
+`PostgresReservationExpirySource` derives current expirable reservations from the authoritative PostgreSQL snapshot into a deadline-indexed table. A scheduler can run:
+
+```js
+await source.refresh();
+const result = await worker.runOnce();
+```
+
+The projection is explicitly derived and may lag. That is safe because `ReservationExpiryWorker` still supplies optimistic `expectedVersion` and the clearinghouse revalidates the current order state before restoring capacity.
+
+See [`POSTGRES_RESERVATION_EXPIRY.md`](POSTGRES_RESERVATION_EXPIRY.md) for schema, refresh, revision-regression, lag, failure, and observability guidance.
+
 ## Replaceable due-reservation source
 
 A deployment may inject any source implementing:
@@ -114,10 +133,10 @@ The worker only requires each candidate to carry:
 
 A production source can therefore use:
 
-- an indexed PostgreSQL table;
+- the provided indexed PostgreSQL projection;
 - a due-time priority queue;
 - a durable scheduler;
-- a read projection maintained from application commits.
+- a read projection maintained from normalized application commits.
 
 The candidate source may be stale; the clearinghouse transition remains the final authority.
 
@@ -157,15 +176,15 @@ Keeping scheduling external preserves deterministic domain behavior and lets dif
 
 ## Production evolution
 
-The reference worker closes the operational loop but does not yet provide a durable due-time index.
+The worker and PostgreSQL source close the basic operational loop, but durable scheduling can still evolve further.
 
-A production-grade scheduler should eventually provide:
+Future production infrastructure may add:
 
-1. indexed due reservations instead of ledger scans;
+1. incremental due-index maintenance rather than full snapshot-derived refresh;
 2. durable wake-up/retry state;
 3. metrics for due backlog and oldest overdue reservation;
 4. dead-letter/alert behavior for repeated infrastructure failures;
-5. idempotent multi-worker operation;
+5. sharding/leases for very high-throughput multi-worker operation;
 6. optional signed-command transport when execution crosses trust/network boundaries.
 
-Do not weaken the kernel deadline/status/version checks when adding those features.
+Do not weaken the kernel deadline/status/version checks when adding those features, and do not rewrite historical ledger events merely to make an incremental projector easier.
