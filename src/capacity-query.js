@@ -127,15 +127,28 @@ function compareOffers(left, right) {
   return String(left.offer.id).localeCompare(String(right.offer.id));
 }
 
+function matchesFilters({ offer, asset }, filters) {
+  if (asset === null) return false;
+  if (filters.service !== null && offer.service !== filters.service) return false;
+  if (filters.unit !== null && offer.unit !== filters.unit) return false;
+  if (filters.settlementAsset !== null && offer.unitPrice?.settlementAsset !== filters.settlementAsset) return false;
+  if (filters.sellerId !== null && offer.sellerId !== filters.sellerId) return false;
+  if (filters.assetType !== null && asset.type !== filters.assetType) return false;
+  if (filters.status !== null && offer.status !== filters.status) return false;
+  if (filters.minRemaining !== null && offer.remaining < filters.minRemaining) return false;
+  if (!filters.capabilities.every((capability) => asset.capabilities?.includes(capability))) return false;
+  if (!matchesAvailableAt(offer, filters.availableAt)) return false;
+  return true;
+}
+
 /**
- * Read-only market discovery above the clearinghouse kernel.
+ * Reference query source backed directly by the live clearinghouse read surface.
  *
- * The directory obtains a stable snapshot by bracketing public market reads with
- * the monotonic clearinghouse revision. Pagination cursors are pinned to that
- * revision and to the exact filter set so a caller never silently paginates
- * across a changing market or reuses a cursor with different search semantics.
+ * It assembles one stable snapshot by bracketing public reads with the monotonic
+ * clearinghouse revision. More scalable sources can implement the same search()
+ * contract without changing CapacityDirectory or its cursor semantics.
  */
-export class CapacityDirectory {
+export class MarketCapacitySource {
   constructor({ market, maxSnapshotRetries = 3 } = {}) {
     invariant(market && typeof market === 'object', 'INVALID_CONFIGURATION', 'market is required');
     for (const method of ['getRevision', 'listAssets', 'listOffers']) {
@@ -146,50 +159,20 @@ export class CapacityDirectory {
     this.maxSnapshotRetries = maxSnapshotRetries;
   }
 
-  async find(input = {}) {
-    const query = normalizeQuery(input);
-    const queryHash = sha256Canonical(filterShape(query));
-    const cursor = decodeCursor(query.cursor);
+  async search({ filters, offset, limit }) {
     const snapshot = await this.#snapshot();
-
-    if (cursor !== null) {
-      invariant(cursor.queryHash === queryHash, 'CURSOR_QUERY_MISMATCH', 'cursor was created for different capacity filters');
-      invariant(cursor.revision === snapshot.revision, 'STALE_CURSOR', 'market changed after the previous page; restart the query', {
-        cursorRevision: cursor.revision,
-        actualRevision: snapshot.revision,
-      });
-    }
-
     const assets = new Map(snapshot.assets.map((asset) => [asset.id, asset]));
     const matches = snapshot.offers
       .map((offer) => ({ offer, asset: assets.get(offer.assetId) ?? null }))
-      .filter(({ offer, asset }) => {
-        if (asset === null) return false;
-        if (query.service !== null && offer.service !== query.service) return false;
-        if (query.unit !== null && offer.unit !== query.unit) return false;
-        if (query.settlementAsset !== null && offer.unitPrice?.settlementAsset !== query.settlementAsset) return false;
-        if (query.sellerId !== null && offer.sellerId !== query.sellerId) return false;
-        if (query.assetType !== null && asset.type !== query.assetType) return false;
-        if (query.status !== null && offer.status !== query.status) return false;
-        if (query.minRemaining !== null && offer.remaining < query.minRemaining) return false;
-        if (!query.capabilities.every((capability) => asset.capabilities?.includes(capability))) return false;
-        if (!matchesAvailableAt(offer, query.availableAt)) return false;
-        return true;
-      })
+      .filter((item) => matchesFilters(item, filters))
       .sort(compareOffers);
 
-    const offset = cursor?.offset ?? 0;
     invariant(offset <= matches.length, 'INVALID_CURSOR', 'cursor offset exceeds the current result set');
-    const items = matches.slice(offset, offset + query.limit);
-    const nextOffset = offset + items.length;
-    const nextCursor = nextOffset < matches.length
-      ? encodeCursor({ schema: CURSOR_SCHEMA, revision: snapshot.revision, offset: nextOffset, queryHash })
-      : null;
-
+    const window = matches.slice(offset, offset + limit + 1);
     return {
       revision: snapshot.revision,
-      items: structuredClone(items),
-      nextCursor,
+      items: structuredClone(window.slice(0, limit)),
+      hasMore: window.length > limit,
     };
   }
 
@@ -204,5 +187,72 @@ export class CapacityDirectory {
       if (before === after) return { revision: after, assets, offers };
     }
     throw new CapacityQueryError('READ_SNAPSHOT_CONFLICT', 'market changed repeatedly while building the capacity read snapshot; retry the query');
+  }
+}
+
+/**
+ * Bounded read-side market discovery with backend-neutral cursor semantics.
+ *
+ * A source must provide:
+ *
+ *   search({ filters, expectedRevision, offset, limit })
+ *     -> { revision, items: [{ offer, asset }], hasMore }
+ *
+ * The directory owns query normalization, filter hashing, opaque cursors, and
+ * stale-cursor behavior. Sources own efficient retrieval from one attributable
+ * clearinghouse revision.
+ */
+export class CapacityDirectory {
+  constructor({ market = null, source = null, maxSnapshotRetries = 3 } = {}) {
+    invariant((market === null) !== (source === null), 'INVALID_CONFIGURATION', 'provide exactly one of market or source');
+    if (source !== null) {
+      invariant(source && typeof source.search === 'function', 'INVALID_CONFIGURATION', 'source must provide search()');
+      this.source = source;
+    } else {
+      this.source = new MarketCapacitySource({ market, maxSnapshotRetries });
+    }
+  }
+
+  async find(input = {}) {
+    const query = normalizeQuery(input);
+    const filters = filterShape(query);
+    const queryHash = sha256Canonical(filters);
+    const cursor = decodeCursor(query.cursor);
+
+    if (cursor !== null) {
+      invariant(cursor.queryHash === queryHash, 'CURSOR_QUERY_MISMATCH', 'cursor was created for different capacity filters');
+    }
+
+    const offset = cursor?.offset ?? 0;
+    const page = await this.source.search({
+      filters,
+      expectedRevision: cursor?.revision ?? null,
+      offset,
+      limit: query.limit,
+    });
+
+    invariant(page && typeof page === 'object' && !Array.isArray(page), 'INVALID_QUERY_SOURCE', 'capacity source returned an invalid page');
+    invariant(Number.isSafeInteger(page.revision) && page.revision >= 0, 'INVALID_QUERY_SOURCE', 'capacity source revision is invalid');
+    invariant(Array.isArray(page.items), 'INVALID_QUERY_SOURCE', 'capacity source items must be an array');
+    invariant(typeof page.hasMore === 'boolean', 'INVALID_QUERY_SOURCE', 'capacity source hasMore must be boolean');
+    invariant(page.items.length <= query.limit, 'INVALID_QUERY_SOURCE', 'capacity source returned more items than requested');
+
+    if (cursor !== null) {
+      invariant(cursor.revision === page.revision, 'STALE_CURSOR', 'market changed after the previous page; restart the query', {
+        cursorRevision: cursor.revision,
+        actualRevision: page.revision,
+      });
+    }
+
+    const nextOffset = offset + page.items.length;
+    const nextCursor = page.hasMore
+      ? encodeCursor({ schema: CURSOR_SCHEMA, revision: page.revision, offset: nextOffset, queryHash })
+      : null;
+
+    return {
+      revision: page.revision,
+      items: structuredClone(page.items),
+      nextCursor,
+    };
   }
 }

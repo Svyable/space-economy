@@ -36,7 +36,8 @@
     "./credentials": "./src/credentials.js",
     "./signed-command": "./src/signed-command.js",
     "./command-executor": "./src/command-executor.js",
-    "./capacity-query": "./src/capacity-query.js"
+    "./capacity-query": "./src/capacity-query.js",
+    "./postgres-capacity-projection": "./src/postgres-capacity-projection.js"
   },
   "scripts": {
     "start": "node src/server.js",
