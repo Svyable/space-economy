@@ -44,7 +44,8 @@
     "./mission-bundle": "./src/mission-bundle.js",
     "./provider-history": "./src/provider-history.js",
     "./market-price-history": "./src/market-price-history.js",
-    "./procurement-evaluation": "./src/procurement-evaluation.js"
+    "./procurement-evaluation": "./src/procurement-evaluation.js",
+    "./rfq-opportunities": "./src/rfq-opportunities.js"
   },
   "scripts": {
     "start": "node src/server.js",
