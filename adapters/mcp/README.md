@@ -11,6 +11,7 @@ Without any write executor, the server exposes:
 ```text
 list_assets
 list_offers
+find_capacity
 get_order
 get_market_status
 ```
@@ -22,6 +23,12 @@ space-economy://protocol/overview
 ```
 
 All default tools are annotated read-only, idempotent, and closed-world.
+
+For market discovery, prefer `find_capacity`. It provides bounded deterministic pages joined with producing asset context and can filter by service, unit, settlement asset, seller, asset type/capabilities, remaining quantity, availability time, and offer status.
+
+`list_offers` remains as a compatibility listing and can return an unbounded match set. It should not be the default choice for large agent contexts.
+
+`find_capacity` returns a clearinghouse `revision` plus an opaque `nextCursor`. Continuation is bound to both that revision and the original filter set. If the market changes between pages, the tool returns `STALE_CURSOR` instead of silently skipping or duplicating offers. See [`../../docs/CAPACITY_DISCOVERY.md`](../../docs/CAPACITY_DISCOVERY.md).
 
 `get_market_status` intentionally returns ledger integrity/head metadata rather than the entire append-only event history. Large event streams should eventually be served through dedicated projections/pagination instead of one unbounded model-context response.
 
@@ -113,6 +120,8 @@ Tests prove:
 
 - the default server has no mutation tool;
 - read tools return current clearinghouse state;
+- bounded capacity discovery returns joined asset/offer context;
+- stale capacity cursors fail explicitly after market mutation;
 - protocol overview is discoverable as a resource;
 - domain errors remain attributable tool errors;
 - injecting a verified command executor exposes the signed write surface;

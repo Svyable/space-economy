@@ -2,6 +2,7 @@ import http from 'node:http';
 import { randomUUID } from 'node:crypto';
 import { fileURLToPath, URL } from 'node:url';
 import { developmentHeaderAuthenticator } from './auth.js';
+import { CapacityDirectory } from './capacity-query.js';
 import { Clearinghouse } from './clearinghouse.js';
 
 const json = (res, status, body, headers = {}) => {
@@ -95,6 +96,8 @@ const statusByCode = {
   RESERVATION_NOT_EXPIRABLE: 409,
   RESERVATION_NOT_DUE: 409,
   STALE_VERSION: 412,
+  STALE_CURSOR: 409,
+  READ_SNAPSHOT_CONFLICT: 409,
   STORE_CONFLICT: 409,
   UNSUPPORTED_MEDIA_TYPE: 415,
   PAYLOAD_TOO_LARGE: 413,
@@ -103,7 +106,7 @@ const statusByCode = {
   INVALID_CONFIGURATION: 500,
 };
 
-async function route(req, res, requestId, market, maxBodyBytes, authenticate) {
+async function route(req, res, requestId, market, capacityDirectory, maxBodyBytes, authenticate) {
   const url = new URL(req.url, `http://${req.headers.host ?? 'localhost'}`);
   const parts = url.pathname.split('/').filter(Boolean);
 
@@ -119,6 +122,25 @@ async function route(req, res, requestId, market, maxBodyBytes, authenticate) {
   }
   if (req.method === 'GET' && url.pathname === '/v1/offers') {
     return json(res, 200, { data: await market.listOffers({ service: url.searchParams.get('service') ?? undefined, status: url.searchParams.get('status') ?? 'open' }) }, { 'x-request-id': requestId });
+  }
+  if (req.method === 'GET' && url.pathname === '/v1/capacity') {
+    const page = await capacityDirectory.find({
+      service: url.searchParams.get('service') ?? undefined,
+      unit: url.searchParams.get('unit') ?? undefined,
+      settlementAsset: url.searchParams.get('settlementAsset') ?? undefined,
+      sellerId: url.searchParams.get('sellerId') ?? undefined,
+      assetType: url.searchParams.get('assetType') ?? undefined,
+      capabilities: url.searchParams.getAll('capability'),
+      minRemaining: url.searchParams.get('minRemaining') ?? undefined,
+      availableAt: url.searchParams.get('availableAt') ?? undefined,
+      status: url.searchParams.has('status') ? url.searchParams.get('status') : undefined,
+      limit: url.searchParams.get('limit') ?? undefined,
+      cursor: url.searchParams.get('cursor') ?? undefined,
+    });
+    return json(res, 200, {
+      data: page.items,
+      meta: { revision: page.revision, nextCursor: page.nextCursor },
+    }, { 'x-request-id': requestId });
   }
   if (req.method === 'POST' && url.pathname === '/v1/offers') {
     return json(res, 201, { data: await market.createOffer(await readBody(req, maxBodyBytes), await requestContext(req, authenticate)) }, { 'x-request-id': requestId });
@@ -158,10 +180,11 @@ export function createHttpServer({
 } = {}) {
   if (!Number.isSafeInteger(maxBodyBytes) || maxBodyBytes <= 0) throw new TypeError('maxBodyBytes must be a positive safe integer');
   if (typeof authenticate !== 'function') throw new TypeError('authenticate must be a function');
+  const capacityDirectory = new CapacityDirectory({ market });
   return http.createServer(async (req, res) => {
     const requestId = req.headers['x-request-id'] || randomUUID();
     try {
-      await route(req, res, requestId, market, maxBodyBytes, authenticate);
+      await route(req, res, requestId, market, capacityDirectory, maxBodyBytes, authenticate);
     } catch (error) {
       problem(req, res, statusByCode[error.code] ?? 400, error, requestId);
     }

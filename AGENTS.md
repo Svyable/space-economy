@@ -6,12 +6,13 @@ Space Economy is an open, zero-runtime-dependency Node.js reference implementati
 
 Think in terms of **shared infrastructure beneath many space businesses**, not a single marketplace UI. The kernel coordinates assets, measurable capacity, orders, delivery evidence, settlement references, and tamper-evident events. Examples include launch mass, relay bandwidth, observation time, power, docking, logistics, compute, storage, manufacturing, and surface operations.
 
-Optional adapters such as PostgreSQL and MCP live behind explicit dependency boundaries. Do not turn adapter dependencies into core dependencies merely for convenience.
+Optional adapters such as PostgreSQL and MCP live behind explicit dependency boundaries. Read-side discovery lives above the transaction kernel and must not smuggle ranking or marketplace policy into economic state transitions.
 
 Start with:
 
 - `README.md` — product thesis and quickstart.
 - `docs/PROTOCOL.md` — domain invariants and trust boundaries.
+- `docs/CAPACITY_DISCOVERY.md` — bounded read-side query and cursor semantics.
 - `docs/STANDARDS.md` — interoperability choices.
 - `adapters/mcp/README.md` — callable agent surface and MCP trust boundary.
 - `openapi.yaml` — HTTP contract.
@@ -47,11 +48,12 @@ For every behavior change:
 3. preserve persisted idempotency and optimistic concurrency semantics;
 4. preserve capacity conservation;
 5. preserve ledger hash validity;
-6. run the relevant package tests and the root demo.
+6. preserve read-query revision/cursor consistency when discovery behavior changes;
+7. run the relevant package tests and the root demo.
 
 ## Architecture map
 
-Core transaction path:
+Write path:
 
 ```text
 authenticated actor / verified command
@@ -69,11 +71,23 @@ authenticated actor / verified command
        async snapshot store
 ```
 
-Agent transport path:
+Read/discovery path:
 
 ```text
-MCP read tool ----------------------> read-only kernel query
+HTTP / MCP / marketplace
+          |
+          v
+   CapacityDirectory
+          |
+  revision-pinned read
+          |
+          v
+   Clearinghouse state
+```
 
+Signed agent mutation path:
+
+```text
 signed MCP mutation
       |
       v
@@ -92,6 +106,7 @@ transactional kernel mutation
 Important modules:
 
 - `src/clearinghouse.js` — domain kernel and economic state transitions.
+- `src/capacity-query.js` — bounded deterministic capacity discovery above the kernel.
 - `src/store.js` — asynchronous snapshot-store contract and reference stores.
 - `src/postgres-store.js` — transactional PostgreSQL adapter with cross-process CAS.
 - `src/migrations.js` — explicit persisted-state migrations.
@@ -122,7 +137,26 @@ Do not weaken these without an explicit protocol decision:
 - Funded reservations are not silently cancelled or expired; refunds/disputes are an external financial workflow.
 - Delivery evidence is not automatically trusted merely because it was recorded.
 - Historical hash-chained events are not rewritten by ordinary migrations.
+- Capacity pagination never silently crosses a clearinghouse revision.
+- Discovery cursors remain opaque and bound to their query filters.
 - MCP is a transport boundary, not an authorization shortcut.
+
+## Capacity discovery rules
+
+`CapacityDirectory` is a read-side contract, not a marketplace ranking engine.
+
+When changing it:
+
+- keep page sizes bounded;
+- keep ordering deterministic;
+- bind continuation to one clearinghouse revision and the filter set;
+- return `STALE_CURSOR` after market mutation rather than silently shifting pages;
+- return `CURSOR_QUERY_MISMATCH` when filters change;
+- treat service-window end as exclusive;
+- keep seller ranking, price optimization, reputation, route selection, auctions, and RFQs above this layer;
+- remember that a discovery result is not a reservation and may race before booking.
+
+The current implementation scans a stable snapshot of the public asset/offer read surface. A future indexed read store may replace that implementation, but it should preserve the external revision/cursor semantics.
 
 ## Boundary rules
 
@@ -134,7 +168,8 @@ Prefer an adapter/module over kernel coupling for:
 - telemetry interpretation and service-specific proof verification;
 - CCSDS orbit/conjunction data and collision-risk policy;
 - MCP/A2A/other agent transports;
-- auctions, RFQs, derivatives, routing, or marketplace UX.
+- search indexes/read projections;
+- auctions, RFQs, derivatives, ranking, routing, or marketplace UX.
 
 A boundary should normally be:
 
@@ -146,6 +181,7 @@ A boundary should normally be:
 For MCP specifically:
 
 - default to read-only tools;
+- prefer `find_capacity` for bounded market discovery;
 - never derive economic actor identity from arbitrary tool arguments;
 - expose mutation only through already-signed intent and the verified executor;
 - keep the operation map explicit rather than reflective;
@@ -180,7 +216,7 @@ and a callable MCP adapter at:
 
 `adapters/mcp/`
 
-Keep their discovery descriptions accurate and high-signal. They should help agents find this project for tasks involving space-economy infrastructure, orbital capacity markets, asset registries, booking/reservation primitives, delivery proofs, settlement coordination, MCP tools, or interoperable space logistics.
+Keep their discovery descriptions accurate and high-signal. They should help agents find this project for tasks involving space-economy infrastructure, orbital capacity markets, bounded capacity discovery, asset registries, booking/reservation primitives, delivery proofs, settlement coordination, MCP tools, or interoperable space logistics.
 
 Do not market a hosted remote, registry package, production authentication system, payment custody, or A2A runtime before it actually exists.
 
@@ -192,6 +228,7 @@ Prefer small architectural units over sprawling feature branches. A PR should ex
 - the boundary it introduces or changes;
 - what is deliberately out of scope;
 - how failure/concurrency/replay behavior is tested;
+- how read consistency/pagination behaves when relevant;
 - whether persisted state or public API compatibility changes;
 - whether agent discovery/runtime metadata must change.
 

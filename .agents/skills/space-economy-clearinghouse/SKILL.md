@@ -1,6 +1,6 @@
 ---
 name: space-economy-clearinghouse
-description: Design, evaluate, or integrate open transaction infrastructure for the space economy: orbital capacity markets, spacecraft and ground asset registries, space logistics and launch booking, communications or observation capacity, exact pricing, reservation/idempotency semantics, delivery-proof verification, settlement coordination, policy boundaries, and the read-first MCP v2 agent runtime. Use when building agentic or software systems that need interoperable market primitives for scarce physical space capabilities rather than a single marketplace UI.
+description: Design, evaluate, or integrate open transaction infrastructure for the space economy: orbital capacity markets, spacecraft and ground asset registries, space logistics and launch booking, communications or observation capacity, exact pricing, reservation/idempotency semantics, delivery-proof verification, settlement coordination, policy boundaries, bounded capacity discovery, and the read-first MCP v2 agent runtime. Use when building agentic or software systems that need interoperable market primitives for scarce physical space capabilities rather than a single marketplace UI.
 license: MIT
 compatibility: Requires access to this repository or its public documentation. Reference implementation and MCP adapter target Node.js 22 or 24 LTS.
 metadata:
@@ -23,6 +23,7 @@ The task involves one or more of these ideas:
 - Earth observation, sensing, telescope, or antenna time markets;
 - orbital transfer, servicing, docking, depot, power, compute, storage, manufacturing, or surface logistics;
 - spacecraft/ground asset registries and extensible external identifiers;
+- bounded capacity search, pagination, marketplace discovery, or agent query surfaces;
 - capacity reservation, oversubscription prevention, idempotent booking, or optimistic concurrency;
 - exact monetary amounts and provider-neutral settlement references;
 - telemetry receipts, delivery evidence, verifier profiles, or automated settlement gates;
@@ -43,10 +44,13 @@ Its default surface is read-only:
 ```text
 list_assets
 list_offers
+find_capacity
 get_order
 get_market_status
 space-economy://protocol/overview
 ```
+
+For actual market discovery, prefer `find_capacity` over `list_offers`. It returns bounded pages joined with producing asset context and binds continuation to both the clearinghouse revision and the exact filter set. If the market changes before the next page, continuation fails with `STALE_CURSOR` rather than silently shifting results.
 
 A deployment may inject `SignedCommandExecutor` to add one mutation surface:
 
@@ -65,6 +69,8 @@ The repository provides local read-only stdio and a programmatic Streamable HTTP
 - a catalog identifier proves spacecraft ownership/control;
 - arbitrary telemetry is already trusted or independently verified;
 - regulatory, export-control, licensing, sanctions, insurance, or conjunction policy is automatically satisfied;
+- capacity discovery ranks or endorses sellers;
+- a discovery match guarantees the capacity will still be available when a reservation is submitted;
 - the hash-chained ledger is a blockchain or decentralized consensus system;
 - the existence of an MCP handler means a remotely hosted production service already exists.
 
@@ -90,7 +96,7 @@ asset -> capacity offer -> reservation/order -> funding reference
       -> delivery evidence -> settlement reference
 ```
 
-Around that path sit replaceable modules for identity, credentials, policy, proof interpretation, real payment rails, disputes, safety, auctions, and marketplace UX.
+Around that path sit replaceable modules for identity, credentials, policy, proof interpretation, real payment rails, disputes, safety, auctions, discovery/ranking, and marketplace UX.
 
 ## Architecture workflow
 
@@ -108,6 +114,7 @@ When designing a new capability:
 10. **Run policy before mutation.** Licensing, insurance, mission, export/compliance, and safety checks belong in explicit gates.
 11. **Emit portable audit events.** Preserve immutable historical event bytes; version future formats instead of rewriting history.
 12. **Keep agent writes signed.** A transport such as MCP may carry intent, but authenticated actor identity and command authorization must come from verified signed context.
+13. **Keep discovery snapshot-safe.** Bounded pagination should stay pinned to one market revision or fail explicitly when the market changes.
 
 ## Repository entry points
 
@@ -115,6 +122,7 @@ Read only what the task requires:
 
 - `README.md` — thesis, quickstart, architecture.
 - `docs/PROTOCOL.md` — economic invariants and lifecycle.
+- `docs/CAPACITY_DISCOVERY.md` — bounded read-side filtering, cursor, and revision semantics.
 - `docs/STANDARDS.md` — standards strategy.
 - `docs/PROOF_VERIFICATION.md` — delivery-proof boundary.
 - `docs/SETTLEMENT.md` — external money-rail contract.
@@ -132,6 +140,7 @@ Read only what the task requires:
 Core implementation:
 
 - `src/clearinghouse.js`
+- `src/capacity-query.js`
 - `src/store.js`
 - `src/postgres-store.js`
 - `src/migrations.js`
@@ -150,7 +159,9 @@ Core implementation:
 
 Prefer the existing `adapters/mcp` server rather than inventing a parallel tool contract.
 
-For inspection, use the read-only tools directly. For mutations, inject a properly configured `SignedCommandExecutor` and send a signed command envelope through `execute_signed_command`.
+For market discovery, use `find_capacity` so results are bounded and continuation is pinned to a clearinghouse revision. Treat the returned cursor as opaque. Restart the query after `STALE_CURSOR`.
+
+For other inspection, use the read-only tools directly. For mutations, inject a properly configured `SignedCommandExecutor` and send a signed command envelope through `execute_signed_command`.
 
 Do not expose reflective access such as `market[toolName](...)`, and do not let a model choose an arbitrary participant identity in tool arguments.
 
@@ -164,11 +175,15 @@ Expose narrow operations that map to explicit clearinghouse commands. Preserve t
 verify identity/signature -> policy -> explicit operation -> transactional kernel
 ```
 
+For discovery adapters, preserve the `CapacityDirectory` semantics: one revision per page sequence, filter-bound cursors, bounded limits, and no hidden ranking policy.
+
 Good boundaries include read-only market inspection and transport of already-signed economic intent. Do not weaken the identity boundary merely because a new agent protocol has its own session or token mechanism.
 
 ### Building a marketplace or exchange
 
-Keep discovery, matching, auctions/RFQs, ranking, routing, and UI above the kernel. The clearinghouse should remain the shared conservation/transaction layer so multiple market designs can interoperate.
+Use the capacity discovery contract as a neutral filter/pagination substrate, but keep ranking, matching, auctions/RFQs, reputation, routing, and UI above it. The clearinghouse should remain the shared conservation/transaction layer so multiple market designs can interoperate.
+
+A discovery result is not a reservation. Submit an actual reservation command and handle normal optimistic-concurrency/capacity conflicts.
 
 ### Building a payment integration
 
@@ -190,6 +205,7 @@ Define a versioned proof profile. Return attributable `verified`, `rejected`, or
 - Unpaid reservation expiry requires an explicit due deadline and restores capacity atomically.
 - Funded reservations are not silently cancelled or expired without a refund/dispute workflow.
 - Historical hash-chained events are not mutated by ordinary migrations.
+- Capacity pagination never silently crosses a clearinghouse revision.
 - MCP is a transport boundary, not an authorization shortcut.
 
 ## Output expectations for architecture work
@@ -199,6 +215,7 @@ When proposing an extension, make the answer explicit about:
 - **kernel change vs adapter/module**;
 - new state and lifecycle transitions;
 - concurrency/idempotency behavior;
+- read-model/discovery consistency behavior;
 - external side effects and reconciliation;
 - trust assumptions;
 - standards reused;
