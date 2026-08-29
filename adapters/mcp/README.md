@@ -38,6 +38,37 @@ STATE_PATH=../../data/state.json npm start
 
 An MCP host can launch the same command as a local subprocess. The host controls process isolation and filesystem access to `STATE_PATH`.
 
+## Workspace discovery
+
+The repository root contains a portable `.mcp.json` for GitHub Copilot CLI / Agent Host and other clients that understand the common `mcpServers` workspace format.
+
+Install adapter dependencies once from the repository root:
+
+```bash
+npm --prefix adapters/mcp install
+```
+
+After you explicitly trust the workspace, a compatible host can start the configured `space-economy` stdio server with:
+
+```text
+npm --prefix adapters/mcp start
+```
+
+The checked-in workspace configuration allowlists exactly:
+
+```text
+list_assets
+list_offers
+get_order
+get_market_status
+```
+
+It intentionally does **not** include `execute_signed_command`, even though a separately assembled MCP deployment can expose that tool with an injected `SignedCommandExecutor`.
+
+Do not change the workspace tool list to `*`. Repository/workspace MCP configurations may be invoked autonomously by agent hosts after trust is granted, so ambient workspace discovery should remain read-only. A deployment that needs economic mutation should configure the signed command executor explicitly outside this generic workspace configuration.
+
+The default `STATE_PATH` resolves to `./data/state.json` because the process is launched from the repository workspace. An operator can use a separately configured MCP server if another store/location is required.
+
 ## Modern Streamable HTTP
 
 `createSpaceEconomyMcpHandler(options)` returns the MCP SDK v2 web-standard handler:
