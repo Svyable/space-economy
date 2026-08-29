@@ -41,7 +41,8 @@
     "./reservation-expiry": "./src/reservation-expiry.js",
     "./postgres-reservation-expiry": "./src/postgres-reservation-expiry.js",
     "./rfq-market": "./src/rfq-market.js",
-    "./mission-bundle": "./src/mission-bundle.js"
+    "./mission-bundle": "./src/mission-bundle.js",
+    "./provider-history": "./src/provider-history.js"
   },
   "scripts": {
     "start": "node src/server.js",
