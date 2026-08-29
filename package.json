@@ -45,7 +45,8 @@
     "./provider-history": "./src/provider-history.js",
     "./market-price-history": "./src/market-price-history.js",
     "./procurement-evaluation": "./src/procurement-evaluation.js",
-    "./rfq-opportunities": "./src/rfq-opportunities.js"
+    "./rfq-opportunities": "./src/rfq-opportunities.js",
+    "./market-liquidity": "./src/market-liquidity.js"
   },
   "scripts": {
     "start": "node src/server.js",
