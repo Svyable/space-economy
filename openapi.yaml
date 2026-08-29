@@ -74,6 +74,69 @@ paths:
       responses:
         '201': { $ref: '#/components/responses/OfferResponse' }
         default: { $ref: '#/components/responses/Problem' }
+  /v1/capacity:
+    get:
+      operationId: findCapacity
+      description: >-
+        Bounded deterministic capacity discovery over a stable clearinghouse revision.
+        Pagination cursors are opaque, filter-bound, and revision-pinned. If the market
+        changes between pages the server returns STALE_CURSOR and the query must restart.
+      parameters:
+        - name: service
+          in: query
+          schema: { type: string, minLength: 1 }
+        - name: unit
+          in: query
+          schema: { type: string, minLength: 1 }
+        - name: settlementAsset
+          in: query
+          schema: { type: string, minLength: 1 }
+        - name: sellerId
+          in: query
+          schema: { type: string, minLength: 1 }
+        - name: assetType
+          in: query
+          schema: { type: string, minLength: 1 }
+        - name: capability
+          in: query
+          description: Repeat the parameter to require multiple asset capabilities. All supplied capabilities must match.
+          explode: true
+          schema:
+            type: array
+            items: { type: string, minLength: 1 }
+        - name: minRemaining
+          in: query
+          schema: { type: integer, minimum: 1 }
+        - name: availableAt
+          in: query
+          description: Instant that must fall within the offer service window. Null offer windows are unbounded.
+          schema: { type: string, format: date-time }
+        - name: status
+          in: query
+          description: Omit for open offers. Use all to include open and filled offers.
+          schema: { type: string, enum: [open, filled, all], default: open }
+        - name: limit
+          in: query
+          schema: { type: integer, minimum: 1, maximum: 100, default: 25 }
+        - name: cursor
+          in: query
+          description: Opaque cursor returned in meta.nextCursor. Do not parse or modify it.
+          schema: { type: string, minLength: 1 }
+      responses:
+        '200':
+          description: Revision-pinned capacity page.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data, meta]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: '#/components/schemas/CapacityMatch' }
+                  meta: { $ref: '#/components/schemas/CapacityPageMeta' }
+        '409': { $ref: '#/components/responses/Problem' }
+        default: { $ref: '#/components/responses/Problem' }
   /v1/orders:
     post:
       operationId: createOrder
@@ -307,6 +370,23 @@ components:
             version: { type: integer, minimum: 1 }
             createdAt: { type: string, format: date-time }
             updatedAt: { type: string, format: date-time }
+    CapacityMatch:
+      type: object
+      required: [offer, asset]
+      properties:
+        offer: { $ref: '#/components/schemas/Offer' }
+        asset: { $ref: '#/components/schemas/Asset' }
+    CapacityPageMeta:
+      type: object
+      required: [revision, nextCursor]
+      properties:
+        revision:
+          type: integer
+          minimum: 0
+          description: Clearinghouse revision from which this page was read.
+        nextCursor:
+          type: [string, 'null']
+          description: Opaque continuation token pinned to this revision and filter set.
     Expiration:
       type: [object, 'null']
       required: [reason, fundingDueAt, expiredAt, triggeredBy]

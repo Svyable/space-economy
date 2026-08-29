@@ -11,6 +11,7 @@ Without any write executor, the server exposes:
 ```text
 list_assets
 list_offers
+find_capacity
 get_order
 get_market_status
 ```
@@ -22,6 +23,12 @@ space-economy://protocol/overview
 ```
 
 All default tools are annotated read-only, idempotent, and closed-world.
+
+For market discovery, prefer `find_capacity`. It provides bounded deterministic pages joined with producing asset context and can filter by service, unit, settlement asset, seller, asset type/capabilities, remaining quantity, availability time, and offer status.
+
+`list_offers` remains as a compatibility listing and can return an unbounded match set. It should not be the default choice for large agent contexts.
+
+`find_capacity` returns a clearinghouse `revision` plus an opaque `nextCursor`. Continuation is bound to both that revision and the original filter set. If the market changes between pages, the tool returns `STALE_CURSOR` instead of silently skipping or duplicating offers. See [`../../docs/CAPACITY_DISCOVERY.md`](../../docs/CAPACITY_DISCOVERY.md).
 
 `get_market_status` intentionally returns ledger integrity/head metadata rather than the entire append-only event history. Large event streams should eventually be served through dedicated projections/pagination instead of one unbounded model-context response.
 
@@ -37,6 +44,37 @@ STATE_PATH=../../data/state.json npm start
 `src/stdio.js` opens the clearinghouse state and serves MCP over stdio. This entrypoint is deliberately read-only.
 
 An MCP host can launch the same command as a local subprocess. The host controls process isolation and filesystem access to `STATE_PATH`.
+
+## Workspace discovery
+
+The repository root contains a portable `.mcp.json` for GitHub Copilot CLI / Agent Host and other clients that understand the common `mcpServers` workspace format.
+
+Install adapter dependencies once from the repository root:
+
+```bash
+npm --prefix adapters/mcp install
+```
+
+After you explicitly trust the workspace, a compatible host can start the configured `space-economy` stdio server with:
+
+```text
+npm --prefix adapters/mcp start
+```
+
+The checked-in workspace configuration allowlists exactly:
+
+```text
+list_assets
+list_offers
+get_order
+get_market_status
+```
+
+It intentionally does **not** include `execute_signed_command`, even though a separately assembled MCP deployment can expose that tool with an injected `SignedCommandExecutor`.
+
+Do not change the workspace tool list to `*`. Repository/workspace MCP configurations may be invoked autonomously by agent hosts after trust is granted, so ambient workspace discovery should remain read-only. A deployment that needs economic mutation should configure the signed command executor explicitly outside this generic workspace configuration.
+
+The default `STATE_PATH` resolves to `./data/state.json` because the process is launched from the repository workspace. An operator can use a separately configured MCP server if another store/location is required.
 
 ## Modern Streamable HTTP
 
@@ -113,6 +151,8 @@ Tests prove:
 
 - the default server has no mutation tool;
 - read tools return current clearinghouse state;
+- bounded capacity discovery returns joined asset/offer context;
+- stale capacity cursors fail explicitly after market mutation;
 - protocol overview is discoverable as a resource;
 - domain errors remain attributable tool errors;
 - injecting a verified command executor exposes the signed write surface;

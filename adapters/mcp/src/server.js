@@ -1,5 +1,6 @@
 import { createMcpHandler, McpServer } from '@modelcontextprotocol/server';
 import * as z from 'zod/v4';
+import { CapacityDirectory } from '../../../src/capacity-query.js';
 
 const READ_ONLY = Object.freeze({
   readOnlyHint: true,
@@ -34,6 +35,8 @@ Non-negotiable invariants:
 - historical hash-chained ledger events are not rewritten by ordinary migrations;
 - external payment, credential, proof, compliance, and mission-safety systems remain explicit trust boundaries.
 
+For market discovery, prefer find_capacity over unbounded offer listing. Capacity pagination is pinned to a clearinghouse revision and filter hash; if the market changes between pages the cursor fails explicitly and the caller restarts the query.
+
 The MCP adapter is read-only unless a SignedCommandExecutor is explicitly injected. When enabled, the only mutation tool accepts a fully signed spaceeconomy.command.v1 envelope and routes it through signature/key verification, policy gates, and the executor's closed operation map.
 `;
 
@@ -42,6 +45,25 @@ const ListOffersInput = z.object({
   service: z.string().min(1).optional().describe('Optional exact service identifier to filter offers.'),
   status: z.enum(['open', 'filled']).nullable().optional()
     .describe('Offer status filter. Omit for open offers; pass null to include every status.'),
+}).strict();
+const FindCapacityInput = z.object({
+  service: z.string().min(1).optional().describe('Exact service identifier, for example data-relay or earth-observation.'),
+  unit: z.string().min(1).optional().describe('Exact billable unit, for example MB, kg, Wh, second, or scene.'),
+  settlementAsset: z.string().min(1).optional().describe('Exact settlement asset identifier, for example iso4217:USD.'),
+  sellerId: z.string().min(1).optional().describe('Optional exact seller participant identifier.'),
+  assetType: z.string().min(1).optional().describe('Optional exact producing asset type.'),
+  capabilities: z.array(z.string().min(1)).max(20).optional()
+    .describe('Asset capabilities that must all be present.'),
+  minRemaining: z.number().int().positive().optional()
+    .describe('Minimum remaining integer capacity required.'),
+  availableAt: z.string().min(1).optional()
+    .describe('Timestamp that must fall inside the offer service window. Null windows are unbounded.'),
+  status: z.enum(['open', 'filled', 'all']).nullable().optional()
+    .describe('Offer status. Omit for open offers; use all or null to include every status.'),
+  limit: z.number().int().min(1).max(100).optional()
+    .describe('Page size from 1 to 100. Defaults to 25.'),
+  cursor: z.string().min(1).optional()
+    .describe('Opaque cursor returned by the previous page. Cursors are pinned to market revision and filters.'),
 }).strict();
 const OrderInput = z.object({
   orderId: z.string().min(1).describe('Clearinghouse order identifier.'),
@@ -126,6 +148,7 @@ export function createSpaceEconomyMcpServer({
   assertCommandExecutor(commandExecutor);
 
   const server = new McpServer({ name, version });
+  const capacityDirectory = new CapacityDirectory({ market });
 
   server.registerResource(
     'space-economy-protocol',
@@ -155,13 +178,31 @@ export function createSpaceEconomyMcpServer({
     'list_offers',
     {
       title: 'List Capacity Offers',
-      description: 'List measurable capacity offers, optionally filtered by service and status. Omit status for currently open offers; use null for every status.',
+      description: 'Compatibility listing for measurable capacity offers, optionally filtered by exact service and status. For bounded market discovery prefer find_capacity.',
       inputSchema: ListOffersInput,
       annotations: READ_ONLY,
     },
     guarded(async ({ service, status }) => result({
       offers: await market.listOffers({ service, status }),
     })),
+  );
+
+  server.registerTool(
+    'find_capacity',
+    {
+      title: 'Find Space Economy Capacity',
+      description: 'Search scarce physical capacity with bounded deterministic pagination. Filters can constrain service, unit, settlement asset, seller, asset type/capabilities, remaining quantity, availability time, and status. Cursors are pinned to one clearinghouse revision and filter set, so market changes fail explicitly instead of shifting pages silently.',
+      inputSchema: FindCapacityInput,
+      annotations: READ_ONLY,
+    },
+    guarded(async (query) => {
+      const page = await capacityDirectory.find(query);
+      return result({
+        revision: page.revision,
+        capacity: page.items,
+        nextCursor: page.nextCursor,
+      });
+    }),
   );
 
   server.registerTool(
