@@ -35,7 +35,8 @@
     "./settlement": "./src/settlement.js",
     "./credentials": "./src/credentials.js",
     "./signed-command": "./src/signed-command.js",
-    "./command-executor": "./src/command-executor.js"
+    "./command-executor": "./src/command-executor.js",
+    "./capacity-query": "./src/capacity-query.js"
   },
   "scripts": {
     "start": "node src/server.js",

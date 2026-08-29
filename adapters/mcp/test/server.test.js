@@ -34,7 +34,7 @@ test('read-first server advertises only inspection tools by default', async () =
   try {
     const listed = await client.listTools();
     const names = listed.tools.map((tool) => tool.name).sort();
-    assert.deepEqual(names, ['get_market_status', 'get_order', 'list_assets', 'list_offers']);
+    assert.deepEqual(names, ['find_capacity', 'get_market_status', 'get_order', 'list_assets', 'list_offers']);
     assert.ok(!names.includes('execute_signed_command'));
     assert.ok(!names.includes('register_asset'));
 
@@ -47,9 +47,13 @@ test('read-first server advertises only inspection tools by default', async () =
   }
 });
 
-test('modern Streamable HTTP client can inspect assets, offers, orders, and ledger status', async () => {
+test('modern Streamable HTTP client can inspect assets, bounded capacity, orders, and ledger status', async () => {
   const market = await Clearinghouse.open();
-  const asset = await market.registerAsset({ name: 'Relay A', type: 'communications-satellite' }, { actorId: 'relay-one' });
+  const asset = await market.registerAsset({
+    name: 'Relay A',
+    type: 'communications-satellite',
+    capabilities: ['data-relay'],
+  }, { actorId: 'relay-one' });
   const offer = await market.createOffer({
     assetId: asset.id,
     service: 'data-relay',
@@ -70,6 +74,24 @@ test('modern Streamable HTTP client can inspect assets, offers, orders, and ledg
     assert.equal(offers.offers[0].id, offer.id);
     assert.equal(offers.offers[0].remaining, 80);
 
+    const capacity = structured(await client.callTool({
+      name: 'find_capacity',
+      arguments: {
+        service: 'data-relay',
+        unit: 'MB',
+        settlementAsset: 'iso4217:USD',
+        assetType: 'communications-satellite',
+        capabilities: ['data-relay'],
+        minRemaining: 50,
+        limit: 1,
+      },
+    }));
+    assert.equal(capacity.revision, 3);
+    assert.equal(capacity.capacity.length, 1);
+    assert.equal(capacity.capacity[0].offer.id, offer.id);
+    assert.equal(capacity.capacity[0].asset.id, asset.id);
+    assert.equal(capacity.nextCursor, null);
+
     const fetched = structured(await client.callTool({ name: 'get_order', arguments: { orderId: order.id } }));
     assert.equal(fetched.order.id, order.id);
     assert.equal(fetched.order.status, 'reserved');
@@ -79,6 +101,46 @@ test('modern Streamable HTTP client can inspect assets, offers, orders, and ledg
     assert.equal(status.ledger.valid, true);
     assert.equal(status.ledger.eventCount, 3);
     assert.match(status.ledger.headHash, /^sha256:/);
+  } finally {
+    await close(client, transport);
+  }
+});
+
+test('MCP capacity cursor fails explicitly after market mutation', async () => {
+  const market = await Clearinghouse.open();
+  const asset = await market.registerAsset({ name: 'Relay', type: 'satellite' }, { actorId: 'seller' });
+  const firstOffer = await market.createOffer({
+    assetId: asset.id,
+    service: 'relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '1', scale: 0 },
+    capacity: 10,
+  }, { actorId: 'seller' });
+  await market.createOffer({
+    assetId: asset.id,
+    service: 'relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '2', scale: 0 },
+    capacity: 10,
+  }, { actorId: 'seller' });
+
+  const { client, transport } = await connect({ market });
+  try {
+    const first = structured(await client.callTool({
+      name: 'find_capacity',
+      arguments: { service: 'relay', limit: 1 },
+    }));
+    assert.equal(first.capacity.length, 1);
+    assert.ok(first.nextCursor);
+
+    await market.createOrder({ offerId: firstOffer.id, quantity: 1 }, { actorId: 'buyer' });
+
+    const stale = await client.callTool({
+      name: 'find_capacity',
+      arguments: { service: 'relay', limit: 1, cursor: first.nextCursor },
+    });
+    assert.equal(stale.isError, true);
+    assert.equal(stale.structuredContent.error.code, 'STALE_CURSOR');
   } finally {
     await close(client, transport);
   }
@@ -94,6 +156,7 @@ test('protocol overview is exposed as an MCP resource', async () => {
     const resource = await client.readResource({ uri: 'space-economy://protocol/overview' });
     assert.equal(resource.contents.length, 1);
     assert.match(resource.contents[0].text, /capacity is conserved/i);
+    assert.match(resource.contents[0].text, /find_capacity/i);
     assert.match(resource.contents[0].text, /read-only unless a SignedCommandExecutor is explicitly injected/i);
   } finally {
     await close(client, transport);

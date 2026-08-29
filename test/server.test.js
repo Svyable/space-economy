@@ -89,6 +89,86 @@ test('HTTP adapter rejects lookalike JSON media types', async () => {
   });
 });
 
+test('HTTP capacity discovery filters and returns revision-aware page metadata', async () => {
+  const market = await Clearinghouse.open();
+  const asset = await market.registerAsset({
+    name: 'Relay A',
+    type: 'communications-satellite',
+    capabilities: ['data-relay', 'store-and-forward'],
+  }, { actorId: 'seller' });
+  const offer = await market.createOffer({
+    assetId: asset.id,
+    service: 'data-relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '15', scale: 2 },
+    capacity: 100,
+  }, { actorId: 'seller' });
+  await market.createOffer({
+    assetId: asset.id,
+    service: 'data-relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'urn:example:credit', amount: '1', scale: 0 },
+    capacity: 100,
+  }, { actorId: 'seller' });
+
+  await withServer(async ({ baseUrl }) => {
+    const params = new URLSearchParams({
+      service: 'data-relay',
+      unit: 'MB',
+      settlementAsset: 'iso4217:USD',
+      assetType: 'communications-satellite',
+      capability: 'data-relay',
+      minRemaining: '50',
+      limit: '1',
+    });
+    const response = await fetch(`${baseUrl}/v1/capacity?${params}`);
+    assert.equal(response.status, 200);
+    const body = await response.json();
+    assert.equal(body.data.length, 1);
+    assert.equal(body.data[0].offer.id, offer.id);
+    assert.equal(body.data[0].asset.id, asset.id);
+    assert.equal(body.meta.revision, 3);
+    assert.equal(body.meta.nextCursor, null);
+  }, { market });
+});
+
+test('HTTP capacity pagination returns conflict when market revision changes', async () => {
+  const market = await Clearinghouse.open();
+  const asset = await market.registerAsset({ name: 'Relay', type: 'satellite' }, { actorId: 'seller' });
+  const firstOffer = await market.createOffer({
+    assetId: asset.id,
+    service: 'relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '1', scale: 0 },
+    capacity: 10,
+  }, { actorId: 'seller' });
+  await market.createOffer({
+    assetId: asset.id,
+    service: 'relay',
+    unit: 'MB',
+    unitPrice: { settlementAsset: 'iso4217:USD', amount: '2', scale: 0 },
+    capacity: 10,
+  }, { actorId: 'seller' });
+
+  await withServer(async ({ baseUrl }) => {
+    const firstResponse = await fetch(`${baseUrl}/v1/capacity?service=relay&limit=1`);
+    assert.equal(firstResponse.status, 200);
+    const first = await firstResponse.json();
+    assert.ok(first.meta.nextCursor);
+
+    await market.createOrder({ offerId: firstOffer.id, quantity: 1 }, { actorId: 'buyer' });
+
+    const params = new URLSearchParams({ service: 'relay', limit: '1', cursor: first.meta.nextCursor });
+    const staleResponse = await fetch(`${baseUrl}/v1/capacity?${params}`);
+    assert.equal(staleResponse.status, 409);
+    assert.match(staleResponse.headers.get('content-type'), /^application\/problem\+json/);
+    const stale = await staleResponse.json();
+    assert.equal(stale.code, 'STALE_CURSOR');
+    assert.equal(stale.details.cursorRevision, first.meta.revision);
+    assert.equal(stale.details.actualRevision, first.meta.revision + 1);
+  }, { market });
+});
+
 test('reservation expiry is exposed as an authenticated optimistic-concurrency command', async () => {
   let current = new Date('2026-08-26T20:00:00.000Z');
   const market = await Clearinghouse.open({ clock: () => new Date(current) });

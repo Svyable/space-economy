@@ -10,9 +10,9 @@ This repository is a zero-runtime-dependency Node.js reference implementation of
 
 If you are an AI coding or research agent, start with [`AGENTS.md`](AGENTS.md). It maps the architecture, invariants, tests, and trust boundaries.
 
-If you are looking for reusable expertise for a task involving **space-economy infrastructure, orbital capacity markets, space logistics, asset registries, booking/reservations, delivery proofs, settlement coordination, MCP tools, or autonomous market agents**, use the Agent Skill at [`.agents/skills/space-economy-clearinghouse/SKILL.md`](.agents/skills/space-economy-clearinghouse/SKILL.md).
+If you are looking for reusable expertise for a task involving **space-economy infrastructure, orbital capacity markets, space logistics, asset registries, capacity discovery, booking/reservations, delivery proofs, settlement coordination, MCP tools, or autonomous market agents**, use the Agent Skill at [`.agents/skills/space-economy-clearinghouse/SKILL.md`](.agents/skills/space-economy-clearinghouse/SKILL.md).
 
-For a callable agent interface, see the read-first MCP v2 adapter in [`adapters/mcp/`](adapters/mcp/). Its default tools only inspect market state. A mutation tool exists only when a deployment injects the verified `SignedCommandExecutor`, so raw MCP arguments never become trusted participant identity.
+For a callable agent interface, see the read-first MCP v2 adapter in [`adapters/mcp/`](adapters/mcp/). For market search, prefer its bounded `find_capacity` tool over unbounded offer listing. A mutation tool exists only when a deployment injects the verified `SignedCommandExecutor`, so raw MCP arguments never become trusted participant identity.
 
 The repository also contains a ready-to-submit GitHub Agent Finder catalog entry at [`distribution/github-agentfinder/space-economy-clearinghouse.json`](distribution/github-agentfinder/space-economy-clearinghouse.json). See [`docs/AGENT_DISCOVERY.md`](docs/AGENT_DISCOVERY.md) for the Agent Skills, MCP Registry, ARD, A2A, and discovery strategy.
 
@@ -41,11 +41,15 @@ The repository also contains a ready-to-submit GitHub Agent Finder catalog entry
 - Provides an explicit signed-command executor that verifies identity, runs policy, and dispatches only whitelisted economic operations.
 - Exposes a versioned HTTP API with RFC 9457 errors and an OpenAPI 3.2 contract.
 
+A separate read-side `CapacityDirectory` provides bounded, deterministic market discovery without putting seller ranking, routing, or marketplace policy into the transaction kernel.
+
 ## What it deliberately does not pretend to do
 
 The reference HTTP server does **not** provide production participant authentication, custody funds, independently verify arbitrary telemetry, prove spacecraft ownership, run conjunction assessment, perform KYC/KYB, or satisfy export-control/licensing requirements. Those are explicit adapter and policy boundaries, not hidden TODOs.
 
 The signed-command and credential modules provide verification **contracts and primitives**. Deployments still own trusted key resolution, key custody/rotation, credential trust anchors, revocation policy, replay storage, and actual organizational authorization.
+
+Capacity discovery reports what the clearinghouse currently records; it does not rank or endorse sellers, establish future physical availability, or reserve capacity. A discovery match can race with another buyer before reservation.
 
 The MCP adapter is callable locally/programmatically, but the repository does **not** claim a hosted production MCP endpoint or public registry package exists yet. Remote exposure requires a real security perimeter and durable deployment.
 
@@ -128,7 +132,28 @@ space-economy-clearinghouse/settlement
 space-economy-clearinghouse/credentials
 space-economy-clearinghouse/signed-command
 space-economy-clearinghouse/command-executor
+space-economy-clearinghouse/capacity-query
 ```
+
+### Capacity discovery
+
+```js
+import { CapacityDirectory } from './src/capacity-query.js';
+
+const directory = new CapacityDirectory({ market });
+const page = await directory.find({
+  service: 'data-relay',
+  unit: 'MB',
+  settlementAsset: 'iso4217:USD',
+  capabilities: ['data-relay'],
+  minRemaining: 1000,
+  limit: 25,
+});
+
+console.log(page.revision, page.items, page.nextCursor);
+```
+
+Discovery cursors are opaque and pinned to both the query filters and one clearinghouse revision. If the market changes between pages, continuation fails with `STALE_CURSOR`; restart the query rather than silently accepting shifted inventory. See [`docs/CAPACITY_DISCOVERY.md`](docs/CAPACITY_DISCOVERY.md).
 
 ### PostgreSQL persistence
 
@@ -158,9 +183,12 @@ Default tools:
 ```text
 list_assets
 list_offers
+find_capacity
 get_order
 get_market_status
 ```
+
+For market search, prefer `find_capacity`; `list_offers` remains a compatibility surface.
 
 Default resource:
 
@@ -191,6 +219,7 @@ GET  /health
 GET  /v1/assets
 POST /v1/assets
 GET  /v1/offers
+GET  /v1/capacity
 POST /v1/offers
 POST /v1/orders
 GET  /v1/orders/:id
@@ -201,6 +230,8 @@ POST /v1/orders/:id/cancel
 POST /v1/orders/:id/expire
 GET  /v1/ledger
 ```
+
+`GET /v1/capacity` is the bounded discovery endpoint. It returns joined asset/offer matches plus `meta.revision` and an opaque `meta.nextCursor`. `GET /v1/offers` remains the simpler compatibility listing.
 
 Mutating calls use a development-only `x-participant-id` actor header. Add an `Idempotency-Key` for retry safety. Existing resources may also use `If-Match: "<version>"`.
 
@@ -244,11 +275,9 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
 ```text
  authenticated HTTP / signed commands / MCP and agent adapters
                     |
-                    v
-          identity + credential verification
+              read discovery
                     |
-                    v
-                policy gates
+              CapacityDirectory
                     |
                     v
           clearinghouse domain kernel
@@ -261,12 +290,17 @@ A 20,000 MB order against that offer totals `300000` at scale `2`, i.e. USD 3,00
           /         |          \
       memory      local JSON   PostgreSQL
 
+Write path:
+authenticated/signed intent -> identity/credentials -> policy -> kernel
+
 External orchestration/adapters:
 payments • proof evidence • compliance services • conjunction safety
-refunds/disputes • insurance • auctions/RFQs • A2A/higher-level agents
+refunds/disputes • insurance • ranking/routing • auctions/RFQs • A2A agents
 ```
 
 The core storage contract is deliberately tiny: `await load()` and `await save(snapshot, { expectedRevision })`. The local JSON adapter uses atomic file replacement and revision checks but remains single-writer. `PostgresSnapshotStore` moves the same contract into a real transaction with cross-process locking and revision CAS. A lost race refreshes the clearinghouse instance from the winning snapshot before returning `STORE_CONFLICT`, so an application can retry against current state.
+
+`CapacityDirectory` currently builds a stable page by reading assets/offers while bracketing those reads with the monotonic clearinghouse revision. Its external query/cursor semantics are intended to survive a future indexed read-model implementation.
 
 Persisted schema v2 adds reservation-expiry fields through an explicit v1→v2 migration. Loading old state does not rewrite it; the migrated snapshot becomes durable only through a later successful normal mutation. See [`docs/MIGRATIONS.md`](docs/MIGRATIONS.md).
 
@@ -296,11 +330,11 @@ See [`docs/STANDARDS.md`](docs/STANDARDS.md) for the versioned rationale, [`docs
 1. Production key-resolution/authentication adapters and operational key rotation/revocation profiles.
 2. Durable settlement/proof orchestration and reconciliation workflows.
 3. Durable reservation-expiry scheduling above the objective kernel transition.
-4. RFQ/auction matching above the clearing kernel.
-5. Concrete CCSDS-backed orbit/conjunction policy gates.
-6. Package or securely host the MCP adapter and publish validated metadata through the Official MCP Registry.
-7. Publish ARD from a publisher-controlled HTTPS domain; add A2A only when an actual higher-level agent runtime exists.
-8. Event/read-model projections for discovery, analytics, and high-volume queries.
+4. Indexed event/read-model projections implementing the stable capacity-discovery contract at production scale.
+5. RFQ/auction matching and ranking/routing above the neutral discovery/clearing layers.
+6. Concrete CCSDS-backed orbit/conjunction policy gates.
+7. Package or securely host the MCP adapter and publish validated metadata through the Official MCP Registry.
+8. Publish ARD from a publisher-controlled HTTPS domain; add A2A only when an actual higher-level agent runtime exists.
 9. External ledger anchoring and portable transaction receipts.
 10. Backup/restore drills, observability, and database deployment hardening for production operators.
 
