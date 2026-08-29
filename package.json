@@ -39,7 +39,8 @@
     "./capacity-query": "./src/capacity-query.js",
     "./postgres-capacity-projection": "./src/postgres-capacity-projection.js",
     "./reservation-expiry": "./src/reservation-expiry.js",
-    "./postgres-reservation-expiry": "./src/postgres-reservation-expiry.js"
+    "./postgres-reservation-expiry": "./src/postgres-reservation-expiry.js",
+    "./rfq-market": "./src/rfq-market.js"
   },
   "scripts": {
     "start": "node src/server.js",
