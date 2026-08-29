@@ -9,6 +9,7 @@ const skillPath = path.join(root, '.agents/skills/space-economy-clearinghouse/SK
 const catalogPath = path.join(root, 'distribution/github-agentfinder/space-economy-clearinghouse.json');
 const mcpPackagePath = path.join(root, 'adapters/mcp/package.json');
 const mcpRegistryTemplatePath = path.join(root, 'distribution/mcp-registry/server.npm.template.json');
+const workspaceMcpPath = path.join(root, '.mcp.json');
 
 function frontmatter(markdown) {
   const match = markdown.match(/^---\n([\s\S]*?)\n---\n/);
@@ -63,6 +64,25 @@ test('MCP Registry template matches adapter package identity but package remains
   assert.equal(pkg.bin['space-economy-mcp'], './src/stdio.js');
 });
 
+test('workspace MCP discovery exposes only the read-only local tool allowlist', async () => {
+  const config = JSON.parse(await fs.readFile(workspaceMcpPath, 'utf8'));
+  assert.deepEqual(Object.keys(config.mcpServers), ['space-economy']);
+  const server = config.mcpServers['space-economy'];
+  assert.equal(server.type, 'stdio');
+  assert.equal(server.command, 'npm');
+  assert.deepEqual(server.args, ['--prefix', 'adapters/mcp', 'start']);
+  assert.equal(server.timeout, 30000);
+  assert.deepEqual(server.tools, [
+    'list_assets',
+    'list_offers',
+    'get_order',
+    'get_market_status',
+  ]);
+  assert.ok(!server.tools.includes('*'));
+  assert.ok(!server.tools.includes('execute_signed_command'));
+  assert.equal(server.env, undefined, 'workspace config must not inject ambient credentials or actor identity');
+});
+
 test('coding-agent instructions preserve core economic and trust boundaries', async () => {
   const agents = await fs.readFile(path.join(root, 'AGENTS.md'), 'utf8');
   for (const rule of [
@@ -88,6 +108,7 @@ test('supported package subpath exports are importable without deep src imports'
     'space-economy-clearinghouse/credentials',
     'space-economy-clearinghouse/signed-command',
     'space-economy-clearinghouse/command-executor',
+    'space-economy-clearinghouse/capacity-query',
     'space-economy-clearinghouse/reservation-expiry',
   ]) {
     const module = await import(specifier);
