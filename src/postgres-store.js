@@ -1,7 +1,9 @@
+import { Buffer } from 'node:buffer';
 import { StoreConflictError } from './store.js';
 
 const clone = (value) => structuredClone(value);
 const IDENTIFIER = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ENCODED_STRING_PREFIX = 'space-economy:pg-json:string:v1:';
 
 function identifier(value, field) {
   if (typeof value !== 'string' || !IDENTIFIER.test(value)) {
@@ -22,13 +24,49 @@ function revision(value, field) {
   return number;
 }
 
+function encodeJsonValue(value) {
+  if (typeof value === 'string') {
+    if (value.includes('\u0000') || value.startsWith(ENCODED_STRING_PREFIX)) {
+      return `${ENCODED_STRING_PREFIX}${Buffer.from(value, 'utf8').toString('base64url')}`;
+    }
+    return value;
+  }
+  if (Array.isArray(value)) return value.map((item) => encodeJsonValue(item));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, encodeJsonValue(item)]));
+  }
+  return value;
+}
+
+function decodeJsonValue(value) {
+  if (typeof value === 'string') {
+    if (!value.startsWith(ENCODED_STRING_PREFIX)) return value;
+    const encoded = value.slice(ENCODED_STRING_PREFIX.length);
+    const decoded = Buffer.from(encoded, 'base64url').toString('utf8');
+    const canonical = `${ENCODED_STRING_PREFIX}${Buffer.from(decoded, 'utf8').toString('base64url')}`;
+    if (canonical !== value) throw new TypeError('persisted snapshot contains an invalid encoded string');
+    return decoded;
+  }
+  if (Array.isArray(value)) return value.map((item) => decodeJsonValue(item));
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, decodeJsonValue(item)]));
+  }
+  return value;
+}
+
 function decodeSnapshot(value) {
-  if (typeof value === 'string') return JSON.parse(value);
-  return clone(value);
+  const decoded = typeof value === 'string' ? JSON.parse(value) : clone(value);
+  return decodeJsonValue(decoded);
 }
 
 /**
  * PostgreSQL-backed snapshot store with transactionally enforced revision CAS.
+ *
+ * PostgreSQL jsonb cannot represent U+0000 in strings. Clearinghouse snapshots
+ * can legitimately contain NUL-separated internal keys (for example durable
+ * idempotency identities), so strings that contain NUL—or that already begin
+ * with this store's encoding prefix—are transparently base64url-encoded before
+ * persistence and decoded again on load.
  *
  * This module intentionally imports no database driver. Pass a pool compatible
  * with node-postgres' `query()` + `connect()` interface (or an equivalent
@@ -78,7 +116,7 @@ export class PostgresSnapshotStore {
     }
     const nextRevision = revision(snapshot.revision, 'snapshot.revision');
     const expected = expectedRevision === null ? null : revision(expectedRevision, 'expectedRevision');
-    const serialized = JSON.stringify(snapshot);
+    const serialized = JSON.stringify(encodeJsonValue(snapshot));
     const client = await this.pool.connect();
     let began = false;
 
