@@ -50,6 +50,7 @@
     "./multi-award-procurement": "./src/multi-award-procurement.js",
     "./market-watchlists": "./src/market-watchlists.js",
     "./federation": "./src/federation.js",
+    "./obligation-netting": "./src/obligation-netting.js",
     "./extensions/*": "./src/extensions/*.js"
   },
   "scripts": {
