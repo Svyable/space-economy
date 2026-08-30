@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const skillPath = path.join(root, '.agents/skills/space-economy-clearinghouse/SKILL.md');
 const catalogPath = path.join(root, 'distribution/github-agentfinder/space-economy-clearinghouse.json');
+const packagePath = path.join(root, 'package.json');
 const mcpPackagePath = path.join(root, 'adapters/mcp/package.json');
 const mcpRegistryTemplatePath = path.join(root, 'distribution/mcp-registry/server.npm.template.json');
 const workspaceMcpPath = path.join(root, '.mcp.json');
@@ -95,33 +96,31 @@ test('coding-agent instructions preserve core economic and trust boundaries', as
   assert.match(agents, /expiry restores capacity atomically/);
 });
 
-test('supported package subpath exports are importable without deep src imports', async () => {
-  for (const specifier of [
-    'space-economy-clearinghouse',
-    'space-economy-clearinghouse/canonical-json',
-    'space-economy-clearinghouse/store',
-    'space-economy-clearinghouse/postgres-store',
-    'space-economy-clearinghouse/migrations',
-    'space-economy-clearinghouse/policy',
-    'space-economy-clearinghouse/proofs',
-    'space-economy-clearinghouse/settlement',
-    'space-economy-clearinghouse/credentials',
-    'space-economy-clearinghouse/signed-command',
-    'space-economy-clearinghouse/command-executor',
-    'space-economy-clearinghouse/capacity-query',
-    'space-economy-clearinghouse/postgres-capacity-projection',
-    'space-economy-clearinghouse/reservation-expiry',
-    'space-economy-clearinghouse/postgres-reservation-expiry',
-    'space-economy-clearinghouse/rfq-market',
-    'space-economy-clearinghouse/mission-bundle',
-    'space-economy-clearinghouse/provider-history',
-    'space-economy-clearinghouse/market-price-history',
-    'space-economy-clearinghouse/procurement-evaluation',
-    'space-economy-clearinghouse/rfq-opportunities',
-    'space-economy-clearinghouse/market-liquidity',
-    'space-economy-clearinghouse/multi-award-procurement',
-    'space-economy-clearinghouse/market-watchlists',
-  ]) {
+test('supported package subpath exports are importable without a duplicated registry', async () => {
+  const pkg = JSON.parse(await fs.readFile(packagePath, 'utf8'));
+  assert.equal(pkg.exports['./extensions/*'], './src/extensions/*.js');
+
+  const exactSpecifiers = Object.keys(pkg.exports)
+    .filter((specifier) => !specifier.includes('*'))
+    .map((specifier) => specifier === '.' ? pkg.name : `${pkg.name}/${specifier.slice(2)}`);
+
+  for (const specifier of exactSpecifiers) {
+    const module = await import(specifier);
+    assert.ok(module && typeof module === 'object', `expected ${specifier} to resolve`);
+  }
+
+  const extensionsDir = path.join(root, 'src/extensions');
+  let entries = [];
+  try {
+    entries = await fs.readdir(extensionsDir, { withFileTypes: true });
+  } catch (error) {
+    if (error.code !== 'ENOENT') throw error;
+  }
+
+  for (const entry of entries) {
+    if (!entry.isFile() || !entry.name.endsWith('.js')) continue;
+    const name = entry.name.slice(0, -3);
+    const specifier = `${pkg.name}/extensions/${name}`;
     const module = await import(specifier);
     assert.ok(module && typeof module === 'object', `expected ${specifier} to resolve`);
   }
