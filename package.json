@@ -49,7 +49,8 @@
     "./market-liquidity": "./src/market-liquidity.js",
     "./multi-award-procurement": "./src/multi-award-procurement.js",
     "./market-watchlists": "./src/market-watchlists.js",
-    "./federation": "./src/federation.js"
+    "./federation": "./src/federation.js",
+    "./extensions/*": "./src/extensions/*.js"
   },
   "scripts": {
     "start": "node src/server.js",
