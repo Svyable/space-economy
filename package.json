@@ -48,7 +48,8 @@
     "./rfq-opportunities": "./src/rfq-opportunities.js",
     "./market-liquidity": "./src/market-liquidity.js",
     "./multi-award-procurement": "./src/multi-award-procurement.js",
-    "./market-watchlists": "./src/market-watchlists.js"
+    "./market-watchlists": "./src/market-watchlists.js",
+    "./federation": "./src/federation.js"
   },
   "scripts": {
     "start": "node src/server.js",
