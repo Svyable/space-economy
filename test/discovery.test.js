@@ -120,6 +120,7 @@ test('supported package subpath exports are importable without deep src imports'
     'space-economy-clearinghouse/rfq-opportunities',
     'space-economy-clearinghouse/market-liquidity',
     'space-economy-clearinghouse/multi-award-procurement',
+    'space-economy-clearinghouse/market-watchlists',
   ]) {
     const module = await import(specifier);
     assert.ok(module && typeof module === 'object', `expected ${specifier} to resolve`);
