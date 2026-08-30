@@ -1,0 +1,92 @@
+name: Auto-merge validated agent PRs
+
+on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  merge:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Merge eligible agent PR
+        uses: actions/github-script@v8
+        with:
+          script: |
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const run = context.payload.workflow_run;
+            const repository = `${owner}/${repo}`;
+
+            const associated = await github.paginate(
+              github.rest.repos.listPullRequestsAssociatedWithCommit,
+              { owner, repo, commit_sha: run.head_sha, per_page: 100 }
+            );
+
+            const pr = associated.find(candidate =>
+              candidate.state === 'open' &&
+              candidate.base.ref === 'main' &&
+              candidate.head.repo?.full_name === repository &&
+              candidate.head.sha === run.head_sha &&
+              candidate.head.ref.startsWith('agent/') &&
+              !candidate.draft
+            );
+
+            if (!pr) {
+              core.info('No current, open, same-repository agent PR matches the validated head SHA.');
+              return;
+            }
+
+            const files = await github.paginate(
+              github.rest.pulls.listFiles,
+              { owner, repo, pull_number: pr.number, per_page: 100 }
+            );
+            const protectedPaths = new Set(['LICENSE', 'SECURITY.md']);
+            if (files.some(file =>
+              protectedPaths.has(file.filename) ||
+              file.filename.startsWith('.github/workflows/')
+            )) {
+              core.info(`PR #${pr.number} changes protected governance/automation paths; skipping unattended merge.`);
+              return;
+            }
+
+            const reviews = await github.paginate(
+              github.rest.pulls.listReviews,
+              { owner, repo, pull_number: pr.number, per_page: 100 }
+            );
+            const latestByUser = new Map();
+            for (const review of reviews) latestByUser.set(review.user?.login, review.state);
+            if ([...latestByUser.values()].includes('CHANGES_REQUESTED')) {
+              core.info(`PR #${pr.number} has an outstanding changes-requested review; skipping.`);
+              return;
+            }
+
+            const refreshed = await github.rest.pulls.get({ owner, repo, pull_number: pr.number });
+            if (
+              refreshed.data.state !== 'open' ||
+              refreshed.data.draft ||
+              refreshed.data.head.sha !== run.head_sha ||
+              refreshed.data.base.ref !== 'main'
+            ) {
+              core.info(`PR #${pr.number} moved after validation; skipping stale merge.`);
+              return;
+            }
+
+            core.info(`Auto-merging validated agent PR #${pr.number}.`);
+            const result = await github.rest.pulls.merge({
+              owner,
+              repo,
+              pull_number: pr.number,
+              merge_method: 'squash',
+              sha: run.head_sha
+            });
+            if (!result.data.merged) {
+              core.setFailed(`GitHub did not merge PR #${pr.number}: ${result.data.message}`);
+            }
