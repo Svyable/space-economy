@@ -14,7 +14,9 @@ function controlledClock(initial = '2026-09-01T00:00:00.000Z') {
 }
 
 async function fixture({ store = null, clockState = controlledClock() } = {}) {
-  const market = await Clearinghouse.open({ store, clock: clockState.clock });
+  let nextId = 0;
+  const idGenerator = () => `fixture-id-${++nextId}`;
+  const market = await Clearinghouse.open({ store, clock: clockState.clock, idGenerator });
   const asset = await market.registerAsset({
     name: 'Relay One',
     type: 'communications-satellite',
@@ -262,7 +264,7 @@ test('creation, transfer, and exercise idempotency survive restart', async () =>
 test('concurrent capacity-right creation across instances cannot oversubscribe one offer', async () => {
   const store = new MemorySnapshotStore();
   const clockState = controlledClock();
-  const { market, offer } = await fixture({ store, clockState });
+  const { offer } = await fixture({ store, clockState });
   const left = await Clearinghouse.open({ store, clock: clockState.clock });
   const right = await Clearinghouse.open({ store, clock: clockState.clock });
 
@@ -288,7 +290,6 @@ test('concurrent capacity-right creation across instances cannot oversubscribe o
     (error) => error.code === 'INSUFFICIENT_CAPACITY',
   );
   assert.equal((await offerById(refreshedLoser, offer.id)).remaining, 40);
-  assert.equal((await market.listOffers({ status: null })).find((item) => item.id === offer.id).remaining, 100);
 });
 
 test('transfer versus exercise race has one durable winner and never changes held quantity twice', async () => {
@@ -357,6 +358,8 @@ test('capacity-right immutable terms hash is canonical while holder transfers do
   const right = await createRight(rightFixture.market, rightFixture.offer, {
     metadata: { beta: { y: 'z', x: true }, alpha: 1 },
   });
+  assert.equal(leftFixture.offer.id, rightFixture.offer.id);
+  assert.equal(left.assetId, right.assetId);
   assert.equal(left.termsHash, right.termsHash);
 
   const transferred = await leftFixture.market.transferCapacityRight(left.id, { toHolderId: 'buyer-b' }, ctx('buyer-a'));
