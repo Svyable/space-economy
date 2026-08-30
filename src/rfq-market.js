@@ -10,6 +10,7 @@ const MARKET_UNAVAILABLE_CODES = new Set([
   'INSUFFICIENT_CAPACITY',
   'OFFER_WINDOW_CLOSED',
   'INVALID_REQUEST',
+  'COMMITMENT_EXPIRED',
 ]);
 
 export class RfqMarketError extends Error {
@@ -95,13 +96,18 @@ function validateServiceWindow(start, end) {
   invariant(Date.parse(start) < Date.parse(end), 'INVALID_REQUEST', 'service window must have start < end');
 }
 
+function earlierTimestamp(left, right) {
+  return Date.parse(left) <= Date.parse(right) ? left : right;
+}
+
 /**
  * Pre-trade request-for-quote market layered above the clearinghouse kernel.
  *
  * RFQs express buyer demand. Quotes bind that demand to an existing authoritative
- * capacity offer. Quote acceptance never creates shadow capacity or custom order
- * pricing: it converts through Clearinghouse.createOrder(), preserving the kernel's
- * capacity conservation, reservation TTL, exact money, and persisted idempotency.
+ * capacity offer. Public-price quotes convert through Clearinghouse.createOrder().
+ * Commitment-backed quotes reference seller-authorized bilateral terms and convert
+ * through Clearinghouse.exerciseCommercialCommitment(). Both paths preserve the
+ * kernel's capacity conservation, exact money, reservation TTL, and idempotency.
  *
  * The RFQ book has its own CAS snapshot store because procurement intent is not
  * clearinghouse transaction state. Acceptance uses a recoverable claim -> reserve
@@ -223,7 +229,17 @@ export class RfqMarket {
 
       const offerId = nonEmptyString(input?.offerId, 'offerId');
       const { offer, asset } = await this.#readOfferAndAsset(offerId);
-      this.#validateOfferForRfq({ rfq, offer, asset, sellerId: actorId });
+      const commercialCommitmentId = optionalString(input?.commercialCommitmentId, 'commercialCommitmentId');
+      let commitment = null;
+      let quotedUnitPrice = offer.unitPrice;
+
+      if (commercialCommitmentId !== null) {
+        commitment = await this.#readCommercialCommitment(commercialCommitmentId, actorId);
+        quotedUnitPrice = commitment.unitPrice;
+        this.#validateCommercialCommitmentForRfq({ rfq, offer, asset, commitment, sellerId: actorId });
+      } else {
+        this.#validateOfferForRfq({ rfq, offer, asset, sellerId: actorId, unitPrice: offer.unitPrice });
+      }
 
       const duplicate = [...this.quotes.values()].find((quote) => (
         quote.rfqId === rfq.id
@@ -234,9 +250,15 @@ export class RfqMarket {
       invariant(!duplicate, 'DUPLICATE_QUOTE', 'an active quote already binds this offer to the RFQ', { quoteId: duplicate?.id });
 
       const now = this.#now();
-      const validUntil = input?.validUntil == null ? rfq.expiresAt : timestamp(input.validUntil, 'validUntil');
+      const defaultValidUntil = commitment === null
+        ? rfq.expiresAt
+        : earlierTimestamp(rfq.expiresAt, commitment.expiresAt);
+      const validUntil = input?.validUntil == null ? defaultValidUntil : timestamp(input.validUntil, 'validUntil');
       invariant(Date.parse(validUntil) > Date.parse(now), 'INVALID_REQUEST', 'validUntil must be in the future');
       invariant(Date.parse(validUntil) <= Date.parse(rfq.expiresAt), 'INVALID_REQUEST', 'validUntil may not exceed the RFQ expiry');
+      if (commitment !== null) {
+        invariant(Date.parse(validUntil) <= Date.parse(commitment.expiresAt), 'INVALID_REQUEST', 'validUntil may not exceed the commercial commitment expiry');
+      }
 
       const quote = {
         id: this.idGenerator(),
@@ -245,9 +267,12 @@ export class RfqMarket {
         assetId: offer.assetId,
         sellerId: actorId,
         quantity: rfq.quantity,
-        unitPrice: clone(offer.unitPrice),
-        total: multiplyAmount(offer.unitPrice, rfq.quantity),
+        unitPrice: clone(quotedUnitPrice),
+        total: multiplyAmount(quotedUnitPrice, rfq.quantity),
         offerVersionAtQuote: offer.version,
+        commercialCommitmentId: commitment?.id ?? null,
+        commercialTermsHash: commitment?.termsHash ?? null,
+        pricingSource: commitment === null ? 'public-offer' : 'commercial-commitment',
         validUntil,
         metadata: input?.metadata ?? {},
         status: 'active',
@@ -341,13 +366,19 @@ export class RfqMarket {
 
       let order;
       try {
-        order = await this.market.createOrder(
-          { offerId: quote.offerId, quantity: rfq.quantity },
-          {
-            actorId: rfq.buyerId,
-            idempotencyKey: `rfq-accept:${sha256Canonical({ rfqId: rfq.id, quoteId: quote.id })}`,
-          },
-        );
+        const idempotencyKey = `rfq-accept:${sha256Canonical({ rfqId: rfq.id, quoteId: quote.id })}`;
+        if (quote.commercialCommitmentId !== null) {
+          this.#assertCommercialCommitmentSupport();
+          order = await this.market.exerciseCommercialCommitment(
+            quote.commercialCommitmentId,
+            { actorId: rfq.buyerId, idempotencyKey },
+          );
+        } else {
+          order = await this.market.createOrder(
+            { offerId: quote.offerId, quantity: rfq.quantity },
+            { actorId: rfq.buyerId, idempotencyKey },
+          );
+        }
       } catch (error) {
         if (!MARKET_UNAVAILABLE_CODES.has(error?.code)) throw error;
 
@@ -367,7 +398,7 @@ export class RfqMarket {
           }
           return { rfq: failedRfq, quote: failedQuote };
         });
-        throw new RfqMarketError('QUOTE_UNAVAILABLE', 'quoted offer can no longer satisfy the RFQ', {
+        throw new RfqMarketError('QUOTE_UNAVAILABLE', 'quoted terms can no longer satisfy the RFQ', {
           quoteId: quote.id,
           causeCode: error.code,
         });
@@ -556,7 +587,42 @@ export class RfqMarket {
     throw new RfqMarketError('READ_SNAPSHOT_CONFLICT', 'market changed repeatedly while validating the quote; retry');
   }
 
-  #validateOfferForRfq({ rfq, offer, asset, sellerId }) {
+  async #readCommercialCommitment(commitmentId, sellerId) {
+    this.#assertCommercialCommitmentSupport();
+    const commitment = await this.market.getCommercialCommitment(commitmentId, { actorId: sellerId });
+    invariant(commitment && typeof commitment === 'object', 'INVALID_STATE', 'commercial commitment response is invalid');
+    return commitment;
+  }
+
+  #assertCommercialCommitmentSupport() {
+    invariant(
+      typeof this.market.getCommercialCommitment === 'function'
+      && typeof this.market.exerciseCommercialCommitment === 'function',
+      'COMMERCIAL_TERMS_UNSUPPORTED',
+      'market does not support commercial commitments',
+    );
+  }
+
+  #validateCommercialCommitmentForRfq({ rfq, offer, asset, commitment, sellerId }) {
+    invariant(commitment.status === 'active', 'CONFLICT', 'commercial commitment is not active');
+    invariant(commitment.offerId === offer.id, 'QUOTE_MISMATCH', 'commercial commitment references a different offer');
+    invariant(commitment.assetId === offer.assetId, 'QUOTE_MISMATCH', 'commercial commitment references a different asset');
+    invariant(commitment.sellerId === sellerId, 'FORBIDDEN', 'seller may only quote its own commercial commitment');
+    invariant(commitment.buyerId === rfq.buyerId, 'QUOTE_MISMATCH', 'commercial commitment is designated for a different buyer');
+    invariant(commitment.service === rfq.service, 'QUOTE_MISMATCH', 'commercial commitment service does not match RFQ');
+    invariant(commitment.unit === rfq.unit, 'QUOTE_MISMATCH', 'commercial commitment unit does not match RFQ');
+    invariant(commitment.quantity === rfq.quantity, 'QUOTE_MISMATCH', 'commercial commitment quantity must equal the single-award RFQ quantity');
+    invariant(typeof commitment.termsHash === 'string' && /^sha256:[0-9a-f]{64}$/.test(commitment.termsHash), 'INVALID_STATE', 'commercial commitment termsHash is invalid');
+    this.#validateOfferForRfq({
+      rfq,
+      offer,
+      asset,
+      sellerId,
+      unitPrice: commitment.unitPrice,
+    });
+  }
+
+  #validateOfferForRfq({ rfq, offer, asset, sellerId, unitPrice = offer.unitPrice }) {
     invariant(offer.status === 'open', 'CONFLICT', 'offer is not open');
     invariant(offer.sellerId === sellerId, 'FORBIDDEN', 'seller may only quote its own offer');
     invariant(offer.sellerId !== rfq.buyerId, 'INVALID_REQUEST', 'buyer and seller must be different participants');
@@ -567,10 +633,10 @@ export class RfqMarket {
     invariant(rfq.requiredCapabilities.every((capability) => asset.capabilities?.includes(capability)), 'QUOTE_MISMATCH', 'offer asset does not satisfy required capabilities');
 
     if (rfq.settlementAsset !== null) {
-      invariant(offer.unitPrice?.settlementAsset === rfq.settlementAsset, 'QUOTE_MISMATCH', 'offer settlement asset does not match RFQ');
+      invariant(unitPrice?.settlementAsset === rfq.settlementAsset, 'QUOTE_MISMATCH', 'quoted settlement asset does not match RFQ');
     }
     if (rfq.maxUnitPrice !== null) {
-      invariant(moneyLessThanOrEqual(offer.unitPrice, rfq.maxUnitPrice), 'QUOTE_PRICE_EXCEEDED', 'offer unit price exceeds RFQ maximum');
+      invariant(moneyLessThanOrEqual(unitPrice, rfq.maxUnitPrice), 'QUOTE_PRICE_EXCEEDED', 'quoted unit price exceeds RFQ maximum');
     }
     if (rfq.serviceWindowStart !== null) {
       if (offer.windowStart !== null) {
@@ -614,7 +680,12 @@ export class RfqMarket {
     invariant(state?.schemaVersion === RFQ_SCHEMA_VERSION, 'UNSUPPORTED_SCHEMA', `unsupported RFQ state schema version: ${state?.schemaVersion ?? 'missing'}`);
     invariant(Number.isSafeInteger(state.revision) && state.revision >= 0, 'CORRUPT_STATE', 'RFQ state revision is invalid');
     this.rfqs = new Map((state.rfqs ?? []).map((item) => [item.id, item]));
-    this.quotes = new Map((state.quotes ?? []).map((item) => [item.id, item]));
+    this.quotes = new Map((state.quotes ?? []).map((item) => [item.id, {
+      ...item,
+      commercialCommitmentId: item.commercialCommitmentId ?? null,
+      commercialTermsHash: item.commercialTermsHash ?? null,
+      pricingSource: item.pricingSource ?? 'public-offer',
+    }]));
     this.idempotency = new Map(state.idempotency ?? []);
     this.revision = state.revision;
   }
