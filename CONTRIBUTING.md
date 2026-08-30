@@ -22,3 +22,11 @@ npm start
 ```
 
 Every bug fix should include a regression test. Every new state transition should include authorization, idempotency, and failure-path coverage.
+
+## Autonomous agent pull requests
+
+Same-repository, non-draft pull requests from `agent/` branches are eligible for unattended squash merge after the repository `ci` workflow succeeds on the exact current head SHA. An outstanding changes-requested review blocks that merge.
+
+Unattended merge deliberately excludes changes to `.github/workflows/`, `LICENSE`, and `SECURITY.md`; those surfaces change the automation or governance boundary and must use an ordinary explicit merge.
+
+For new optional public modules that do not belong in the transaction kernel, prefer one independently testable file under `src/extensions/`. The package exports `space-economy-clearinghouse/extensions/*` through a wildcard, so independent extension PRs do not need to edit the shared `package.json` export registry. Existing compatibility subpaths remain explicit.
