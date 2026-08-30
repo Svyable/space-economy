@@ -35,12 +35,12 @@ function optionalPositiveInteger(value, field) {
   return positiveInteger(value, field);
 }
 
-function normalizeUnitPrice(value) {
-  invariant(value && typeof value === 'object' && !Array.isArray(value), 'INVALID_REQUEST', 'unitPrice is required');
-  const settlementAsset = nonEmptyString(value.settlementAsset, 'unitPrice.settlementAsset');
-  invariant(typeof value.amount === 'string' && /^[0-9]+$/.test(value.amount), 'INVALID_REQUEST', 'unitPrice.amount must be an unsigned integer string');
-  invariant(BigInt(value.amount) > 0n, 'INVALID_REQUEST', 'unitPrice.amount must be positive');
-  invariant(Number.isSafeInteger(value.scale) && value.scale >= 0 && value.scale <= 18, 'INVALID_REQUEST', 'unitPrice.scale must be an integer from 0 to 18');
+function normalizeUnitPrice(value, field = 'unitPrice') {
+  invariant(value && typeof value === 'object' && !Array.isArray(value), 'INVALID_REQUEST', `${field} is required`);
+  const settlementAsset = nonEmptyString(value.settlementAsset, `${field}.settlementAsset`);
+  invariant(typeof value.amount === 'string' && /^[0-9]+$/.test(value.amount), 'INVALID_REQUEST', `${field}.amount must be an unsigned integer string`);
+  invariant(BigInt(value.amount) > 0n, 'INVALID_REQUEST', `${field}.amount must be positive`);
+  invariant(Number.isSafeInteger(value.scale) && value.scale >= 0 && value.scale <= 18, 'INVALID_REQUEST', `${field}.scale must be an integer from 0 to 18`);
   return { settlementAsset, amount: value.amount, scale: value.scale };
 }
 
@@ -412,6 +412,291 @@ export class Clearinghouse {
     });
   }
 
+  createCapacityRight(input, context) {
+    return this.#command('capacity-right.create', context, input, ({ actorId }) => {
+      const offer = this.offers.get(input?.offerId);
+      invariant(offer, 'NOT_FOUND', 'offer not found');
+      invariant(offer.sellerId === actorId, 'FORBIDDEN', 'only the offer seller may hold capacity out as a right');
+      invariant(offer.status === 'open', 'CONFLICT', 'offer is not open');
+
+      const timestamp = this.#now();
+      if (offer.windowEnd !== null) {
+        invariant(Date.parse(timestamp) < Date.parse(offer.windowEnd), 'OFFER_WINDOW_CLOSED', 'offer service window has ended');
+      }
+      const holderId = nonEmptyString(input?.holderId, 'holderId');
+      invariant(holderId !== actorId, 'INVALID_REQUEST', 'capacity right holder and seller must be different participants');
+      const quantity = positiveInteger(input?.quantity, 'quantity');
+      invariant(quantity <= offer.remaining, 'INSUFFICIENT_CAPACITY', 'capacity right quantity exceeds current remaining capacity', {
+        remaining: offer.remaining,
+      });
+      const exerciseUnitPrice = normalizeUnitPrice(input?.exerciseUnitPrice, 'exerciseUnitPrice');
+      const expiresAt = nonEmptyString(input?.expiresAt, 'expiresAt');
+      const expiresMs = Date.parse(expiresAt);
+      invariant(Number.isFinite(expiresMs), 'INVALID_REQUEST', 'expiresAt must be an RFC 3339 timestamp');
+      invariant(expiresMs > Date.parse(timestamp), 'INVALID_REQUEST', 'expiresAt must be in the future');
+      if (offer.windowEnd !== null) {
+        invariant(expiresMs <= Date.parse(offer.windowEnd), 'INVALID_REQUEST', 'capacity right may not outlive the offer service window');
+      }
+
+      let reservationTtlSeconds;
+      if (Object.prototype.hasOwnProperty.call(input ?? {}, 'reservationTtlSeconds')) {
+        reservationTtlSeconds = optionalPositiveInteger(input.reservationTtlSeconds, 'reservationTtlSeconds');
+      } else {
+        reservationTtlSeconds = offer.reservationTtlSeconds;
+      }
+      if (reservationTtlSeconds !== null) this.#addSeconds(timestamp, reservationTtlSeconds, 'reservationTtlSeconds');
+      const metadata = normalizeMetadata(input?.metadata);
+      const immutableTerms = {
+        offerId: offer.id,
+        assetId: offer.assetId,
+        sellerId: actorId,
+        service: offer.service,
+        unit: offer.unit,
+        quantity,
+        exerciseUnitPrice,
+        reservationTtlSeconds,
+        expiresAt: new Date(expiresMs).toISOString(),
+        metadata,
+      };
+
+      offer.remaining -= quantity;
+      offer.status = offer.remaining === 0 ? 'filled' : 'open';
+      offer.version += 1;
+      offer.updatedAt = timestamp;
+
+      const right = {
+        id: this.idGenerator(),
+        ...immutableTerms,
+        termsHash: `sha256:${sha256Canonical(immutableTerms)}`,
+        initialHolderId: holderId,
+        holderId,
+        transfers: [],
+        status: 'held',
+        orderId: null,
+        release: null,
+        expiration: null,
+        exercisedAt: null,
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      this.capacityRights.set(right.id, right);
+      this.#record('spaceeconomy.capacity-right.created.v1', `capacity-right/${right.id}`, {
+        capacityRightId: right.id,
+        offerId: right.offerId,
+        assetId: right.assetId,
+        sellerId: right.sellerId,
+        holderId: right.holderId,
+        quantity: right.quantity,
+        exerciseUnitPrice: right.exerciseUnitPrice,
+        expiresAt: right.expiresAt,
+        termsHash: right.termsHash,
+      });
+      return this.#viewCapacityRight(right, timestamp);
+    });
+  }
+
+  getCapacityRight(capacityRightId, context) {
+    return this.#read(() => {
+      const { actorId } = normalizeContext(context);
+      const right = this.#capacityRight(capacityRightId);
+      invariant(this.#isCapacityRightParty(right, actorId), 'FORBIDDEN', 'actor is not a party to the capacity right');
+      return this.#viewCapacityRight(right);
+    });
+  }
+
+  listCapacityRights(context, { status = null } = {}) {
+    return this.#read(() => {
+      const { actorId } = normalizeContext(context);
+      if (status !== null) {
+        invariant(['held', 'released', 'expired', 'exercised'].includes(status), 'INVALID_REQUEST', 'unsupported capacity right status');
+      }
+      const timestamp = this.#now();
+      return [...this.capacityRights.values()]
+        .filter((right) => this.#isCapacityRightParty(right, actorId))
+        .map((right) => this.#viewCapacityRight(right, timestamp))
+        .filter((right) => status === null || right.status === status)
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+    });
+  }
+
+  transferCapacityRight(capacityRightId, input, context) {
+    return this.#command('capacity-right.transfer', context, { capacityRightId, ...input }, ({ actorId, expectedVersion }) => {
+      const right = this.#capacityRight(capacityRightId);
+      invariant(actorId === right.holderId, 'FORBIDDEN', 'only the current holder may transfer the capacity right');
+      this.#expectVersion(right, expectedVersion);
+      invariant(right.status === 'held', 'CONFLICT', 'only a held capacity right may be transferred');
+      const timestamp = this.#now();
+      invariant(Date.parse(timestamp) < Date.parse(right.expiresAt), 'CAPACITY_RIGHT_EXPIRED', 'capacity right exercise deadline has passed');
+      const toHolderId = nonEmptyString(input?.toHolderId, 'toHolderId');
+      invariant(toHolderId !== right.holderId, 'INVALID_REQUEST', 'new holder must differ from current holder');
+      invariant(toHolderId !== right.sellerId, 'INVALID_REQUEST', 'capacity right may not be transferred to its seller; release it instead');
+
+      const fromHolderId = right.holderId;
+      right.holderId = toHolderId;
+      right.transfers.push({
+        sequence: right.transfers.length + 1,
+        fromHolderId,
+        toHolderId,
+        transferredAt: timestamp,
+      });
+      right.version += 1;
+      right.updatedAt = timestamp;
+      this.#record('spaceeconomy.capacity-right.transferred.v1', `capacity-right/${right.id}`, {
+        capacityRightId: right.id,
+        offerId: right.offerId,
+        sellerId: right.sellerId,
+        fromHolderId,
+        toHolderId,
+        transferSequence: right.transfers.length,
+        termsHash: right.termsHash,
+      });
+      return this.#viewCapacityRight(right, timestamp);
+    });
+  }
+
+  releaseCapacityRight(capacityRightId, context) {
+    return this.#command('capacity-right.release', context, { capacityRightId }, ({ actorId, expectedVersion }) => {
+      const right = this.#capacityRight(capacityRightId);
+      invariant(actorId === right.holderId, 'FORBIDDEN', 'only the current holder may release the capacity right');
+      this.#expectVersion(right, expectedVersion);
+      invariant(right.status === 'held', 'CONFLICT', 'only a held capacity right may be released');
+      const timestamp = this.#now();
+      invariant(Date.parse(timestamp) < Date.parse(right.expiresAt), 'CAPACITY_RIGHT_EXPIRED', 'capacity right exercise deadline has passed; expire it instead');
+
+      this.#restoreCapacityRight(right, timestamp);
+      right.status = 'released';
+      right.release = { releasedAt: timestamp, releasedBy: actorId };
+      right.version += 1;
+      right.updatedAt = timestamp;
+      this.#record('spaceeconomy.capacity-right.released.v1', `capacity-right/${right.id}`, {
+        capacityRightId: right.id,
+        offerId: right.offerId,
+        sellerId: right.sellerId,
+        holderId: right.holderId,
+        quantity: right.quantity,
+        releasedBy: actorId,
+        termsHash: right.termsHash,
+      });
+      return this.#viewCapacityRight(right, timestamp);
+    });
+  }
+
+  expireCapacityRight(capacityRightId, context) {
+    return this.#command('capacity-right.expire', context, { capacityRightId }, ({ actorId, expectedVersion }) => {
+      const right = this.#capacityRight(capacityRightId);
+      this.#expectVersion(right, expectedVersion);
+      invariant(right.status === 'held', 'CONFLICT', 'only a held capacity right may expire');
+      const timestamp = this.#now();
+      invariant(Date.parse(timestamp) >= Date.parse(right.expiresAt), 'CAPACITY_RIGHT_NOT_DUE', 'capacity right exercise deadline has not been reached', {
+        expiresAt: right.expiresAt,
+      });
+
+      this.#restoreCapacityRight(right, timestamp);
+      right.status = 'expired';
+      right.expiration = {
+        expiredAt: timestamp,
+        triggeredBy: actorId,
+      };
+      right.version += 1;
+      right.updatedAt = timestamp;
+      this.#record('spaceeconomy.capacity-right.expired.v1', `capacity-right/${right.id}`, {
+        capacityRightId: right.id,
+        offerId: right.offerId,
+        sellerId: right.sellerId,
+        holderId: right.holderId,
+        quantity: right.quantity,
+        expiresAt: right.expiresAt,
+        triggeredBy: actorId,
+        termsHash: right.termsHash,
+      });
+      return this.#viewCapacityRight(right, timestamp);
+    });
+  }
+
+  exerciseCapacityRight(capacityRightId, context) {
+    return this.#command('capacity-right.exercise', context, { capacityRightId }, ({ actorId, expectedVersion }) => {
+      const right = this.#capacityRight(capacityRightId);
+      invariant(actorId === right.holderId, 'FORBIDDEN', 'only the current holder may exercise the capacity right');
+      if (right.status === 'exercised') {
+        invariant(right.orderId !== null, 'CORRUPT_STATE', 'exercised capacity right is missing its order');
+        return this.#order(right.orderId);
+      }
+      this.#expectVersion(right, expectedVersion);
+      invariant(right.status === 'held', 'CONFLICT', 'capacity right is not held');
+      const timestamp = this.#now();
+      invariant(Date.parse(timestamp) < Date.parse(right.expiresAt), 'CAPACITY_RIGHT_EXPIRED', 'capacity right exercise deadline has passed');
+
+      const offer = this.offers.get(right.offerId);
+      invariant(offer, 'CORRUPT_STATE', 'capacity right references a missing offer');
+      invariant(offer.sellerId === right.sellerId, 'CORRUPT_STATE', 'capacity right seller no longer matches its offer');
+      if (offer.windowEnd !== null) {
+        invariant(Date.parse(timestamp) < Date.parse(offer.windowEnd), 'OFFER_WINDOW_CLOSED', 'offer service window has ended');
+      }
+
+      const total = {
+        ...right.exerciseUnitPrice,
+        amount: multiplyAmount(right.exerciseUnitPrice.amount, right.quantity),
+      };
+      const fundingDueAt = right.reservationTtlSeconds === null
+        ? null
+        : this.#addSeconds(timestamp, right.reservationTtlSeconds, 'reservationTtlSeconds');
+      const order = {
+        id: this.idGenerator(),
+        offerId: right.offerId,
+        assetId: right.assetId,
+        sellerId: right.sellerId,
+        buyerId: right.holderId,
+        service: right.service,
+        unit: right.unit,
+        quantity: right.quantity,
+        unitPrice: clone(right.exerciseUnitPrice),
+        total,
+        status: 'reserved',
+        fundingDueAt,
+        funding: null,
+        deliveryProof: null,
+        settlement: null,
+        expiration: null,
+        capacityRight: {
+          id: right.id,
+          termsHash: right.termsHash,
+        },
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      this.orders.set(order.id, order);
+
+      right.status = 'exercised';
+      right.orderId = order.id;
+      right.exercisedAt = timestamp;
+      right.version += 1;
+      right.updatedAt = timestamp;
+
+      this.#record('spaceeconomy.order.reserved.v1', `order/${order.id}`, {
+        orderId: order.id,
+        offerId: order.offerId,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        quantity: order.quantity,
+        total: order.total,
+        fundingDueAt: order.fundingDueAt,
+        capacityRightId: right.id,
+        capacityRightTermsHash: right.termsHash,
+      });
+      this.#record('spaceeconomy.capacity-right.exercised.v1', `capacity-right/${right.id}`, {
+        capacityRightId: right.id,
+        orderId: order.id,
+        offerId: right.offerId,
+        sellerId: right.sellerId,
+        holderId: right.holderId,
+        termsHash: right.termsHash,
+      });
+      return order;
+    });
+  }
+
   createOrder(input, context) {
     return this.#command('order.reserve', context, input, ({ actorId, expectedVersion }) => {
       const offer = this.offers.get(input?.offerId);
@@ -630,6 +915,7 @@ export class Clearinghouse {
     this.offers = new Map();
     this.orders = new Map();
     this.commercialCommitments = new Map();
+    this.capacityRights = new Map();
     this.ledger = [];
     this.idempotency = new Map();
     this.revision = 0;
@@ -709,6 +995,17 @@ export class Clearinghouse {
     offer.updatedAt = timestamp;
   }
 
+  #restoreCapacityRight(right, timestamp) {
+    const offer = this.offers.get(right.offerId);
+    invariant(offer, 'CORRUPT_STATE', 'capacity right references a missing offer');
+    invariant(offer.sellerId === right.sellerId, 'CORRUPT_STATE', 'capacity right seller no longer matches its offer');
+    offer.remaining += right.quantity;
+    invariant(offer.remaining <= offer.capacity, 'CORRUPT_STATE', 'capacity right restoration violates offer capacity');
+    offer.status = 'open';
+    offer.version += 1;
+    offer.updatedAt = timestamp;
+  }
+
   #record(type, subject, data) {
     const previoushash = this.ledger.at(-1)?.hash ?? 'GENESIS';
     const unsigned = {
@@ -751,6 +1048,12 @@ export class Clearinghouse {
     return commitment;
   }
 
+  #capacityRight(id) {
+    const right = this.capacityRights.get(id);
+    invariant(right, 'NOT_FOUND', 'capacity right not found');
+    return right;
+  }
+
   #viewCommercialCommitment(commitment, timestamp = null) {
     const view = clone(commitment);
     const observedAt = timestamp ?? this.#now();
@@ -758,6 +1061,18 @@ export class Clearinghouse {
       view.status = 'expired';
     }
     return view;
+  }
+
+  #viewCapacityRight(right, timestamp = null) {
+    const view = clone(right);
+    const observedAt = timestamp ?? this.#now();
+    view.expiryDue = view.status === 'held' && Date.parse(observedAt) >= Date.parse(view.expiresAt);
+    return view;
+  }
+
+  #isCapacityRightParty(right, actorId) {
+    if (actorId === right.sellerId || actorId === right.initialHolderId || actorId === right.holderId) return true;
+    return right.transfers.some((transfer) => actorId === transfer.fromHolderId || actorId === transfer.toHolderId);
   }
 
   #validateWindow(start, end) {
@@ -790,6 +1105,7 @@ export class Clearinghouse {
       offers: [...this.offers.values()].map((item) => clone(item)),
       orders: [...this.orders.values()].map((item) => clone(item)),
       commercialCommitments: [...this.commercialCommitments.values()].map((item) => clone(item)),
+      capacityRights: [...this.capacityRights.values()].map((item) => clone(item)),
       ledger: clone(this.ledger),
       idempotency: [...this.idempotency.entries()].map(([key, value]) => [key, clone(value)]),
     };
@@ -802,6 +1118,7 @@ export class Clearinghouse {
     this.offers = new Map((state.offers ?? []).map((item) => [item.id, item]));
     this.orders = new Map((state.orders ?? []).map((item) => [item.id, item]));
     this.commercialCommitments = new Map((state.commercialCommitments ?? []).map((item) => [item.id, item]));
+    this.capacityRights = new Map((state.capacityRights ?? []).map((item) => [item.id, item]));
     this.ledger = state.ledger ?? [];
     this.idempotency = new Map(state.idempotency ?? []);
     this.revision = state.revision;

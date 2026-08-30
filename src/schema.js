@@ -1,6 +1,6 @@
 import { SnapshotMigrationRegistry } from './migrations.js';
 
-export const CURRENT_SCHEMA_VERSION = 3;
+export const CURRENT_SCHEMA_VERSION = 4;
 
 /**
  * Clearinghouse-owned persisted-state migrations.
@@ -26,5 +26,10 @@ export function createClearinghouseMigrationRegistry() {
       ...snapshot,
       schemaVersion: 3,
       commercialCommitments: snapshot.commercialCommitments ?? [],
+    }))
+    .register(3, (snapshot) => ({
+      ...snapshot,
+      schemaVersion: 4,
+      capacityRights: snapshot.capacityRights ?? [],
     }));
 }

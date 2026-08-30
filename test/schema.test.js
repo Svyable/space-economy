@@ -35,33 +35,59 @@ const v2Snapshot = () => ({
   idempotency: [],
 });
 
-test('clearinghouse schema v3 composes expiry and commercial commitment migrations without rewriting ledger history', async () => {
+const v3Snapshot = () => ({
+  schemaVersion: 3,
+  revision: 0,
+  assets: [],
+  offers: [],
+  orders: [],
+  commercialCommitments: [{ id: 'terms-existing', status: 'active' }],
+  ledger: [{ opaque: 'v3-historical-event-remains-logically-identical' }],
+  idempotency: [],
+});
+
+test('clearinghouse schema v4 composes expiry, commercial commitment, and capacity-right migrations without rewriting ledger history', async () => {
   const snapshot = v1Snapshot();
   snapshot.ledger = [{ opaque: 'historical-event-bytes-stay-logically-identical' }];
   const migrated = await createClearinghouseMigrationRegistry().migrate(snapshot);
 
-  assert.equal(migrated.schemaVersion, 3);
+  assert.equal(migrated.schemaVersion, 4);
   assert.equal(migrated.offers[0].reservationTtlSeconds, null);
   assert.equal(migrated.orders[0].fundingDueAt, null);
   assert.equal(migrated.orders[0].expiration, null);
   assert.deepEqual(migrated.commercialCommitments, []);
+  assert.deepEqual(migrated.capacityRights, []);
   assert.deepEqual(migrated.ledger, snapshot.ledger);
   assert.equal(snapshot.schemaVersion, 1);
   assert.equal(snapshot.offers[0].reservationTtlSeconds, undefined);
   assert.equal(snapshot.commercialCommitments, undefined);
+  assert.equal(snapshot.capacityRights, undefined);
 });
 
-test('schema v2 to v3 adds only the commercial commitment collection', async () => {
+test('schema v2 to v4 composes commercial commitment and capacity-right collections', async () => {
   const snapshot = v2Snapshot();
   const migrated = await createClearinghouseMigrationRegistry().migrate(snapshot);
-  assert.equal(migrated.schemaVersion, 3);
+  assert.equal(migrated.schemaVersion, 4);
   assert.deepEqual(migrated.commercialCommitments, []);
+  assert.deepEqual(migrated.capacityRights, []);
   assert.deepEqual(migrated.ledger, snapshot.ledger);
   assert.equal(snapshot.schemaVersion, 2);
   assert.equal(snapshot.commercialCommitments, undefined);
+  assert.equal(snapshot.capacityRights, undefined);
 });
 
-test('Clearinghouse.open reads v1 state through migration and persists v3 only on the next successful mutation', async () => {
+test('schema v3 to v4 adds only the capacity-right collection', async () => {
+  const snapshot = v3Snapshot();
+  const migrated = await createClearinghouseMigrationRegistry().migrate(snapshot);
+  assert.equal(migrated.schemaVersion, 4);
+  assert.deepEqual(migrated.commercialCommitments, snapshot.commercialCommitments);
+  assert.deepEqual(migrated.capacityRights, []);
+  assert.deepEqual(migrated.ledger, snapshot.ledger);
+  assert.equal(snapshot.schemaVersion, 3);
+  assert.equal(snapshot.capacityRights, undefined);
+});
+
+test('Clearinghouse.open reads v1 state through migration and persists v4 only on the next successful mutation', async () => {
   const rawStore = new MemorySnapshotStore(v1Snapshot());
   const market = await Clearinghouse.open({ store: rawStore });
 
@@ -71,14 +97,16 @@ test('Clearinghouse.open reads v1 state through migration and persists v3 only o
   assert.equal(legacyOrder.fundingDueAt, null);
   assert.equal(legacyOrder.expiration, null);
   assert.deepEqual(await market.listCommercialCommitments({ actorId: 'owner' }), []);
+  assert.deepEqual(await market.listCapacityRights({ actorId: 'owner' }), []);
 
   assert.equal((await rawStore.load()).schemaVersion, 1);
 
   await market.registerAsset({ name: 'Migrated write', type: 'satellite' }, { actorId: 'owner' });
   const persisted = await rawStore.load();
-  assert.equal(persisted.schemaVersion, 3);
+  assert.equal(persisted.schemaVersion, 4);
   assert.equal(persisted.offers[0].reservationTtlSeconds, null);
   assert.equal(persisted.orders[0].fundingDueAt, null);
   assert.equal(persisted.orders[0].expiration, null);
   assert.deepEqual(persisted.commercialCommitments, []);
+  assert.deepEqual(persisted.capacityRights, []);
 });
