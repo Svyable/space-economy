@@ -44,6 +44,17 @@ function normalizeUnitPrice(value) {
   return { settlementAsset, amount: value.amount, scale: value.scale };
 }
 
+function normalizeMetadata(value) {
+  const metadata = value ?? {};
+  invariant(metadata && typeof metadata === 'object' && !Array.isArray(metadata), 'INVALID_REQUEST', 'metadata must be an object');
+  try {
+    sha256Canonical(metadata);
+  } catch (error) {
+    throw new DomainError('INVALID_REQUEST', `metadata must be canonical JSON: ${error.message}`);
+  }
+  return clone(metadata);
+}
+
 function multiplyAmount(amount, quantity) {
   return (BigInt(amount) * BigInt(quantity)).toString();
 }
@@ -185,6 +196,220 @@ export class Clearinghouse {
     return this.#read(() => [...this.offers.values()]
       .filter((offer) => (!service || offer.service === service) && (!status || offer.status === status))
       .map((offer) => clone(offer)));
+  }
+
+  createCommercialCommitment(input, context) {
+    return this.#command('commercial-commitment.create', context, input, ({ actorId }) => {
+      const offer = this.offers.get(input?.offerId);
+      invariant(offer, 'NOT_FOUND', 'offer not found');
+      invariant(offer.sellerId === actorId, 'FORBIDDEN', 'only the offer seller may issue commercial terms');
+      invariant(offer.status === 'open', 'CONFLICT', 'offer is not open');
+
+      const timestamp = this.#now();
+      if (offer.windowEnd !== null) {
+        invariant(Date.parse(timestamp) < Date.parse(offer.windowEnd), 'OFFER_WINDOW_CLOSED', 'offer service window has ended');
+      }
+      const buyerId = nonEmptyString(input?.buyerId, 'buyerId');
+      invariant(buyerId !== actorId, 'INVALID_REQUEST', 'buyer and seller must be different participants');
+      const quantity = positiveInteger(input?.quantity, 'quantity');
+      invariant(quantity <= offer.remaining, 'INSUFFICIENT_CAPACITY', 'commitment quantity exceeds current remaining capacity', {
+        remaining: offer.remaining,
+      });
+      const unitPrice = normalizeUnitPrice(input?.unitPrice);
+      const expiresAt = nonEmptyString(input?.expiresAt, 'expiresAt');
+      const expiresMs = Date.parse(expiresAt);
+      invariant(Number.isFinite(expiresMs), 'INVALID_REQUEST', 'expiresAt must be an RFC 3339 timestamp');
+      invariant(expiresMs > Date.parse(timestamp), 'INVALID_REQUEST', 'expiresAt must be in the future');
+      if (offer.windowEnd !== null) {
+        invariant(expiresMs <= Date.parse(offer.windowEnd), 'INVALID_REQUEST', 'commitment may not outlive the offer service window');
+      }
+
+      let reservationTtlSeconds;
+      if (Object.prototype.hasOwnProperty.call(input ?? {}, 'reservationTtlSeconds')) {
+        reservationTtlSeconds = optionalPositiveInteger(input.reservationTtlSeconds, 'reservationTtlSeconds');
+      } else {
+        reservationTtlSeconds = offer.reservationTtlSeconds;
+      }
+      if (reservationTtlSeconds !== null) this.#addSeconds(timestamp, reservationTtlSeconds, 'reservationTtlSeconds');
+      const metadata = normalizeMetadata(input?.metadata);
+      const immutableTerms = {
+        offerId: offer.id,
+        assetId: offer.assetId,
+        sellerId: actorId,
+        buyerId,
+        service: offer.service,
+        unit: offer.unit,
+        quantity,
+        unitPrice,
+        reservationTtlSeconds,
+        expiresAt: new Date(expiresMs).toISOString(),
+        metadata,
+      };
+      const commitment = {
+        id: this.idGenerator(),
+        ...immutableTerms,
+        termsHash: `sha256:${sha256Canonical(immutableTerms)}`,
+        status: 'active',
+        orderId: null,
+        revocation: null,
+        exercisedAt: null,
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      this.commercialCommitments.set(commitment.id, commitment);
+      this.#record('spaceeconomy.commercial-commitment.created.v1', `commercial-commitment/${commitment.id}`, {
+        commitmentId: commitment.id,
+        offerId: offer.id,
+        sellerId: actorId,
+        buyerId,
+        quantity,
+        unitPrice,
+        reservationTtlSeconds,
+        expiresAt: commitment.expiresAt,
+        termsHash: commitment.termsHash,
+      });
+      return this.#viewCommercialCommitment(commitment, timestamp);
+    });
+  }
+
+  getCommercialCommitment(commitmentId, context) {
+    return this.#read(() => {
+      const { actorId } = normalizeContext(context);
+      const commitment = this.#commercialCommitment(commitmentId);
+      invariant(actorId === commitment.sellerId || actorId === commitment.buyerId, 'FORBIDDEN', 'actor is not a party to the commitment');
+      return this.#viewCommercialCommitment(commitment);
+    });
+  }
+
+  listCommercialCommitments(context, { status = null } = {}) {
+    return this.#read(() => {
+      const { actorId } = normalizeContext(context);
+      if (status !== null) {
+        invariant(['active', 'expired', 'revoked', 'exercised'].includes(status), 'INVALID_REQUEST', 'unsupported commitment status');
+      }
+      const timestamp = this.#now();
+      return [...this.commercialCommitments.values()]
+        .filter((commitment) => actorId === commitment.sellerId || actorId === commitment.buyerId)
+        .map((commitment) => this.#viewCommercialCommitment(commitment, timestamp))
+        .filter((commitment) => status === null || commitment.status === status)
+        .sort((left, right) => left.createdAt.localeCompare(right.createdAt) || left.id.localeCompare(right.id));
+    });
+  }
+
+  revokeCommercialCommitment(commitmentId, context) {
+    return this.#command('commercial-commitment.revoke', context, { commitmentId }, ({ actorId, expectedVersion }) => {
+      const commitment = this.#commercialCommitment(commitmentId);
+      invariant(actorId === commitment.sellerId, 'FORBIDDEN', 'only the seller may revoke the commitment');
+      this.#expectVersion(commitment, expectedVersion);
+      invariant(commitment.status === 'active', 'CONFLICT', 'only an active commitment may be revoked');
+      const timestamp = this.#now();
+      invariant(Date.parse(timestamp) < Date.parse(commitment.expiresAt), 'COMMITMENT_EXPIRED', 'commercial commitment has expired');
+      commitment.status = 'revoked';
+      commitment.revocation = { revokedAt: timestamp, revokedBy: actorId };
+      commitment.version += 1;
+      commitment.updatedAt = timestamp;
+      this.#record('spaceeconomy.commercial-commitment.revoked.v1', `commercial-commitment/${commitment.id}`, {
+        commitmentId: commitment.id,
+        offerId: commitment.offerId,
+        sellerId: commitment.sellerId,
+        buyerId: commitment.buyerId,
+        termsHash: commitment.termsHash,
+      });
+      return this.#viewCommercialCommitment(commitment, timestamp);
+    });
+  }
+
+  exerciseCommercialCommitment(commitmentId, context) {
+    return this.#command('commercial-commitment.exercise', context, { commitmentId }, ({ actorId, expectedVersion }) => {
+      const commitment = this.#commercialCommitment(commitmentId);
+      invariant(actorId === commitment.buyerId, 'FORBIDDEN', 'only the designated buyer may exercise the commitment');
+      if (commitment.status === 'exercised') {
+        invariant(commitment.orderId !== null, 'CORRUPT_STATE', 'exercised commitment is missing its order');
+        return this.#order(commitment.orderId);
+      }
+      this.#expectVersion(commitment, expectedVersion);
+      invariant(commitment.status === 'active', 'CONFLICT', 'commercial commitment is not active');
+
+      const timestamp = this.#now();
+      invariant(Date.parse(timestamp) < Date.parse(commitment.expiresAt), 'COMMITMENT_EXPIRED', 'commercial commitment has expired');
+      const offer = this.offers.get(commitment.offerId);
+      invariant(offer, 'CORRUPT_STATE', 'commercial commitment references a missing offer');
+      invariant(offer.sellerId === commitment.sellerId, 'CORRUPT_STATE', 'commercial commitment seller no longer matches its offer');
+      invariant(offer.status === 'open', 'CONFLICT', 'offer is not open');
+      if (offer.windowEnd !== null) {
+        invariant(Date.parse(timestamp) < Date.parse(offer.windowEnd), 'OFFER_WINDOW_CLOSED', 'offer service window has ended');
+      }
+      invariant(commitment.quantity <= offer.remaining, 'INSUFFICIENT_CAPACITY', 'insufficient capacity to exercise commercial commitment', {
+        remaining: offer.remaining,
+      });
+
+      offer.remaining -= commitment.quantity;
+      offer.status = offer.remaining === 0 ? 'filled' : 'open';
+      offer.version += 1;
+      offer.updatedAt = timestamp;
+
+      const total = {
+        ...commitment.unitPrice,
+        amount: multiplyAmount(commitment.unitPrice.amount, commitment.quantity),
+      };
+      const fundingDueAt = commitment.reservationTtlSeconds === null
+        ? null
+        : this.#addSeconds(timestamp, commitment.reservationTtlSeconds, 'reservationTtlSeconds');
+      const order = {
+        id: this.idGenerator(),
+        offerId: offer.id,
+        assetId: offer.assetId,
+        sellerId: commitment.sellerId,
+        buyerId: commitment.buyerId,
+        service: commitment.service,
+        unit: commitment.unit,
+        quantity: commitment.quantity,
+        unitPrice: clone(commitment.unitPrice),
+        total,
+        status: 'reserved',
+        fundingDueAt,
+        funding: null,
+        deliveryProof: null,
+        settlement: null,
+        expiration: null,
+        commercialCommitment: {
+          id: commitment.id,
+          termsHash: commitment.termsHash,
+        },
+        version: 1,
+        createdAt: timestamp,
+        updatedAt: timestamp,
+      };
+      this.orders.set(order.id, order);
+
+      commitment.status = 'exercised';
+      commitment.orderId = order.id;
+      commitment.exercisedAt = timestamp;
+      commitment.version += 1;
+      commitment.updatedAt = timestamp;
+
+      this.#record('spaceeconomy.order.reserved.v1', `order/${order.id}`, {
+        orderId: order.id,
+        offerId: offer.id,
+        buyerId: order.buyerId,
+        sellerId: order.sellerId,
+        quantity: order.quantity,
+        total: order.total,
+        fundingDueAt: order.fundingDueAt,
+        commercialCommitmentId: commitment.id,
+        commercialTermsHash: commitment.termsHash,
+      });
+      this.#record('spaceeconomy.commercial-commitment.exercised.v1', `commercial-commitment/${commitment.id}`, {
+        commitmentId: commitment.id,
+        orderId: order.id,
+        offerId: offer.id,
+        sellerId: commitment.sellerId,
+        buyerId: commitment.buyerId,
+        termsHash: commitment.termsHash,
+      });
+      return order;
+    });
   }
 
   createOrder(input, context) {
@@ -404,6 +629,7 @@ export class Clearinghouse {
     this.assets = new Map();
     this.offers = new Map();
     this.orders = new Map();
+    this.commercialCommitments = new Map();
     this.ledger = [];
     this.idempotency = new Map();
     this.revision = 0;
@@ -519,6 +745,21 @@ export class Clearinghouse {
     return order;
   }
 
+  #commercialCommitment(id) {
+    const commitment = this.commercialCommitments.get(id);
+    invariant(commitment, 'NOT_FOUND', 'commercial commitment not found');
+    return commitment;
+  }
+
+  #viewCommercialCommitment(commitment, timestamp = null) {
+    const view = clone(commitment);
+    const observedAt = timestamp ?? this.#now();
+    if (view.status === 'active' && Date.parse(observedAt) >= Date.parse(view.expiresAt)) {
+      view.status = 'expired';
+    }
+    return view;
+  }
+
   #validateWindow(start, end) {
     if (start === null && end === null) return;
     invariant(typeof start === 'string' && typeof end === 'string', 'INVALID_REQUEST', 'windowStart and windowEnd must both be RFC 3339 timestamps');
@@ -548,6 +789,7 @@ export class Clearinghouse {
       assets: [...this.assets.values()].map((item) => clone(item)),
       offers: [...this.offers.values()].map((item) => clone(item)),
       orders: [...this.orders.values()].map((item) => clone(item)),
+      commercialCommitments: [...this.commercialCommitments.values()].map((item) => clone(item)),
       ledger: clone(this.ledger),
       idempotency: [...this.idempotency.entries()].map(([key, value]) => [key, clone(value)]),
     };
@@ -559,6 +801,7 @@ export class Clearinghouse {
     this.assets = new Map((state.assets ?? []).map((item) => [item.id, item]));
     this.offers = new Map((state.offers ?? []).map((item) => [item.id, item]));
     this.orders = new Map((state.orders ?? []).map((item) => [item.id, item]));
+    this.commercialCommitments = new Map((state.commercialCommitments ?? []).map((item) => [item.id, item]));
     this.ledger = state.ledger ?? [];
     this.idempotency = new Map(state.idempotency ?? []);
     this.revision = state.revision;
