@@ -42,6 +42,7 @@
     "./postgres-reservation-expiry": "./src/postgres-reservation-expiry.js",
     "./rfq-market": "./src/rfq-market.js",
     "./mission-bundle": "./src/mission-bundle.js",
+    "./mission-portfolio": "./src/mission-portfolio.js",
     "./provider-history": "./src/provider-history.js",
     "./market-price-history": "./src/market-price-history.js",
     "./procurement-evaluation": "./src/procurement-evaluation.js",
